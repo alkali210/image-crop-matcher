@@ -8,7 +8,14 @@ import numpy as np
 from crop_matcher.catalog import ImageCatalog, ImageRecord
 from crop_matcher.config import Settings
 from crop_matcher.feature_index import FeatureIndex
-from crop_matcher.imaging import gradient_magnitude, normalized_correlation, read_image, to_gray
+from crop_matcher.imaging import (
+    gradient_magnitude,
+    normalized_correlation,
+    perceptual_hash,
+    read_image,
+    resize_to_max,
+    to_gray,
+)
 
 
 class _NoMatchEvidenceError(RuntimeError):
@@ -273,4 +280,100 @@ class ImageMatcher:
         return float(np.clip((normalized_correlation(left, right) + 1.0) / 2.0, 0.0, 1.0))
 
     def _fallback(self, query_gray: np.ndarray) -> MatchResult:
-        raise _NoMatchEvidenceError("No primary geometric match evidence")
+        if not self.catalog.records or not self.index.image_ids or not len(self.index.tiles.hashes):
+            raise _NoMatchEvidenceError("Fallback index is empty")
+
+        query_hash = perceptual_hash(query_gray)
+        xor = np.bitwise_xor(self.index.tiles.hashes, query_hash)
+        distances = np.fromiter(
+            (int(value).bit_count() for value in xor),
+            dtype=np.uint8,
+            count=len(xor),
+        )
+        order = np.argsort(distances, kind="stable")
+        target_count = min(max(1, self.settings.candidate_count), len(self.index.image_ids))
+        candidate_indices: list[int] = []
+        candidate_set: set[int] = set()
+        for tile_index in order:
+            image_index = int(self.index.tiles.image_indices[tile_index])
+            if not 0 <= image_index < len(self.index.image_ids) or image_index in candidate_set:
+                continue
+            candidate_indices.append(image_index)
+            candidate_set.add(image_index)
+            if len(candidate_indices) == target_count:
+                break
+        if len(candidate_indices) < target_count:
+            candidate_indices.extend(
+                image_index
+                for image_index in range(len(self.index.image_ids))
+                if image_index not in candidate_set
+            )
+            candidate_indices = candidate_indices[:target_count]
+
+        scored = [self._template_score(index, query_gray) for index in candidate_indices]
+        ranking = sorted(
+            zip(candidate_indices, scored, strict=True),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+        best_index, best_score = ranking[0]
+        second_score = ranking[1][1] if len(ranking) > 1 else 0.0
+        margin = float(np.clip((best_score - second_score) / 0.2, 0.0, 1.0))
+        similarity = round(min(89.9, 100.0 * (0.85 * best_score + 0.15 * margin)), 1)
+        record = self.catalog.get(self.index.image_ids[best_index])
+        return MatchResult(record, similarity, "phash", 0, 0.0, best_score)
+
+    def _template_score(self, image_index: int, query_gray: np.ndarray) -> float:
+        query_height, query_width = query_gray.shape[:2]
+        if query_height == 0 or query_width == 0:
+            return 0.0
+
+        record = self.catalog.get(self.index.image_ids[image_index])
+        candidate, _ = resize_to_max(
+            read_image(record.path, self.settings.max_image_pixels),
+            self.settings.working_max_edge,
+        )
+        candidate_gray = to_gray(candidate)
+        candidate_height, candidate_width = candidate_gray.shape[:2]
+        owner_mask = self.index.tiles.image_indices == image_index
+        indexed_sizes = np.unique(self.index.tiles.sizes[owner_mask])
+        pyramid_sizes = sorted(
+            {int(size) for size in indexed_sizes}
+            | {
+                (int(left) + int(right)) // 2
+                for left, right in zip(indexed_sizes, indexed_sizes[1:])
+            }
+        )
+        query_gradient = gradient_magnitude(query_gray)
+        best_score = 0.0
+        seen_dimensions: set[tuple[int, int]] = set()
+
+        for tile_size in pyramid_sizes:
+            if tile_size <= 0:
+                continue
+            scale = min(1.0, min(query_height, query_width) / int(tile_size))
+            level_width = max(1, round(candidate_width * scale))
+            level_height = max(1, round(candidate_height * scale))
+            dimensions = (level_width, level_height)
+            if dimensions in seen_dimensions:
+                continue
+            seen_dimensions.add(dimensions)
+            if query_width > level_width or query_height > level_height:
+                continue
+            if dimensions == (candidate_width, candidate_height):
+                level = candidate_gray
+            else:
+                level = cv2.resize(candidate_gray, dimensions, interpolation=cv2.INTER_AREA)
+
+            gray_score = self._template_peak(level, query_gray)
+            edge_score = self._template_peak(gradient_magnitude(level), query_gradient)
+            best_score = max(best_score, 0.7 * gray_score + 0.3 * edge_score)
+
+        return float(np.clip(best_score, 0.0, 1.0))
+
+    @staticmethod
+    def _template_peak(candidate: np.ndarray, query: np.ndarray) -> float:
+        response = cv2.matchTemplate(candidate, query, cv2.TM_CCOEFF_NORMED)
+        finite = response[np.isfinite(response)]
+        peak = float(finite.max()) if len(finite) else -1.0
+        return float(np.clip((peak + 1.0) / 2.0, 0.0, 1.0))

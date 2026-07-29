@@ -11,8 +11,8 @@ from crop_matcher.config import Settings
 from crop_matcher.feature_index import FeatureIndex
 
 
-def write_textured_image(path: Path, offset: int) -> None:
-    image = np.zeros((160, 160, 3), np.uint8)
+def write_textured_image(path: Path, offset: int, shape: tuple[int, int] = (160, 160)) -> None:
+    image = np.zeros((*shape, 3), np.uint8)
     cv2.putText(
         image,
         f"MATCH-{offset}",
@@ -29,9 +29,9 @@ def write_textured_image(path: Path, offset: int) -> None:
     path.write_bytes(payload.tobytes())
 
 
-def write_blank_image(path: Path) -> None:
+def write_blank_image(path: Path, shape: tuple[int, int] = (40, 60)) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    ok, payload = cv2.imencode(".png", np.zeros((40, 60, 3), np.uint8))
+    ok, payload = cv2.imencode(".png", np.zeros((*shape, 3), np.uint8))
     assert ok
     path.write_bytes(payload.tobytes())
 
@@ -56,6 +56,94 @@ def test_builds_global_descriptors_and_round_trips_cache(tmp_path: Path) -> None
     assert np.array_equal(loaded.descriptor_image_indices, built.descriptor_image_indices)
 
 
+def test_feature_index_builds_typed_hash_tiles(tmp_path: Path) -> None:
+    gallery = tmp_path / "songs"
+    write_textured_image(gallery / "one" / "base.jpg", 0)
+    settings = Settings(gallery_dir=gallery, cache_dir=tmp_path / "cache")
+    catalog = ImageCatalog.scan(gallery, settings.max_image_pixels)
+
+    built = FeatureIndex.load_or_build(catalog, settings)
+    loaded = FeatureIndex.load_or_build(catalog, settings)
+
+    expected_dtypes = (np.uint64, np.int32, np.int32, np.int32, np.int32)
+    built_arrays = (
+        built.tiles.hashes,
+        built.tiles.image_indices,
+        built.tiles.xs,
+        built.tiles.ys,
+        built.tiles.sizes,
+    )
+    loaded_arrays = (
+        loaded.tiles.hashes,
+        loaded.tiles.image_indices,
+        loaded.tiles.xs,
+        loaded.tiles.ys,
+        loaded.tiles.sizes,
+    )
+    assert len(built.tiles.hashes) > 0
+    assert all(array.shape == built.tiles.hashes.shape for array in built_arrays)
+    for built_array, loaded_array, dtype in zip(
+        built_arrays, loaded_arrays, expected_dtypes, strict=True
+    ):
+        assert built_array.dtype == dtype
+        assert built_array.flags.c_contiguous
+        assert np.array_equal(loaded_array, built_array)
+
+
+def test_feature_index_includes_right_and_bottom_aligned_tiles(tmp_path: Path) -> None:
+    gallery = tmp_path / "songs"
+    write_textured_image(gallery / "one" / "base.jpg", 0, shape=(130, 150))
+    settings = Settings(
+        gallery_dir=gallery,
+        cache_dir=tmp_path / "cache",
+        tile_sizes=(64,),
+    )
+    catalog = ImageCatalog.scan(gallery, settings.max_image_pixels)
+
+    index = FeatureIndex.load_or_build(catalog, settings)
+
+    positions = set(zip(index.tiles.xs.tolist(), index.tiles.ys.tolist(), strict=True))
+    assert positions == {(x, y) for x in (0, 32, 64, 86) for y in (0, 32, 64, 66)}
+    assert set(index.tiles.sizes) == {64}
+    assert set(index.tiles.image_indices) == {0}
+
+
+def test_images_smaller_than_every_tile_size_are_safe(tmp_path: Path) -> None:
+    gallery = tmp_path / "songs"
+    write_blank_image(gallery / "small" / "base.png")
+    settings = Settings(
+        gallery_dir=gallery,
+        cache_dir=tmp_path / "cache",
+        tile_sizes=(64,),
+    )
+    catalog = ImageCatalog.scan(gallery, settings.max_image_pixels)
+
+    built = FeatureIndex.load_or_build(catalog, settings)
+    loaded = FeatureIndex.load_or_build(catalog, settings)
+
+    assert built.tiles.hashes.shape == (0,)
+    assert loaded.tiles.hashes.shape == (0,)
+    assert loaded.loaded_from_cache is True
+
+
+def test_single_pixel_tile_size_uses_a_safe_stride(tmp_path: Path) -> None:
+    gallery = tmp_path / "songs"
+    write_blank_image(gallery / "small" / "base.png", shape=(8, 8))
+    settings = Settings(
+        gallery_dir=gallery,
+        cache_dir=tmp_path / "cache",
+        tile_sizes=(1,),
+    )
+    catalog = ImageCatalog.scan(gallery, settings.max_image_pixels)
+
+    index = FeatureIndex.load_or_build(catalog, settings)
+
+    assert index.tiles.hashes.shape == (64,)
+    assert set(zip(index.tiles.xs, index.tiles.ys, strict=True)) == {
+        (x, y) for x in range(8) for y in range(8)
+    }
+
+
 def test_manifest_change_invalidates_cache(tmp_path: Path) -> None:
     gallery = tmp_path / "songs"
     path = gallery / "one" / "base.jpg"
@@ -75,10 +163,11 @@ def test_manifest_change_invalidates_cache(tmp_path: Path) -> None:
         ("working_max_edge", 96),
         ("sift_features", 25),
         ("sift_contrast_threshold", 0.08),
+        ("tile_sizes", (64,)),
     ],
 )
 def test_feature_setting_change_invalidates_cache(
-    tmp_path: Path, setting_name: str, changed_value: int | float
+    tmp_path: Path, setting_name: str, changed_value: int | float | tuple[int, ...]
 ) -> None:
     gallery = tmp_path / "songs"
     write_textured_image(gallery / "one" / "base.jpg", 0)
@@ -92,7 +181,8 @@ def test_feature_setting_change_invalidates_cache(
     assert rebuilt.loaded_from_cache is False
     metadata = json.loads((settings.cache_dir / "manifest.json").read_text("utf-8"))
     assert isinstance(metadata["schema_version"], int)
-    assert metadata["feature_settings"][setting_name] == changed_value
+    expected_value = list(changed_value) if isinstance(changed_value, tuple) else changed_value
+    assert metadata["feature_settings"][setting_name] == expected_value
 
 
 def test_malformed_manifest_is_rebuilt_and_replaced(tmp_path: Path) -> None:
@@ -118,6 +208,8 @@ def test_malformed_manifest_is_rebuilt_and_replaced(tmp_path: Path) -> None:
         "missing_array",
         "bad_offsets",
         "bad_descriptor_owner",
+        "bad_tile_owner",
+        "bad_tile_geometry",
         "wrong_image_ids",
         "wrong_cache_identity",
     ],
@@ -143,6 +235,10 @@ def test_corrupt_feature_cache_is_rebuilt(tmp_path: Path, corruption: str) -> No
             arrays["point_offsets"][-1] += 1
         elif corruption == "bad_descriptor_owner":
             arrays["descriptor_image_indices"][:] = len(catalog.records)
+        elif corruption == "bad_tile_owner":
+            arrays["tile_image_indices"][0] = len(catalog.records)
+        elif corruption == "bad_tile_geometry":
+            arrays["tile_xs"][0] = -1
         elif corruption == "wrong_image_ids":
             arrays["image_ids"][:] = "wrong-image-id"
         else:

@@ -9,7 +9,7 @@ import pytest
 from crop_matcher import matcher as matcher_module
 from crop_matcher.catalog import ImageCatalog, ImageRecord
 from crop_matcher.config import Settings
-from crop_matcher.feature_index import FeatureIndex, ImageFeatures
+from crop_matcher.feature_index import FeatureIndex, ImageFeatures, TileFeatures
 from crop_matcher.matcher import CandidateScore, ImageMatcher
 
 
@@ -121,6 +121,116 @@ def test_matches_resized_crop_to_source(
     assert result.record.parent_name == "song-1"
     assert result.method == "sift"
     assert 0.0 <= result.similarity <= 100.0
+
+
+def test_low_feature_crop_uses_fallback(tmp_path: Path) -> None:
+    gallery = tmp_path / "songs"
+    first = np.zeros((320, 320, 3), np.uint8)
+    second = np.zeros((320, 320, 3), np.uint8)
+    cv2.rectangle(first, (40, 40), (280, 280), (80, 80, 80), -1)
+    cv2.rectangle(first, (110, 110), (210, 210), (180, 180, 180), -1)
+    cv2.rectangle(second, (40, 40), (280, 280), (80, 80, 80), -1)
+    cv2.circle(second, (160, 160), 50, (180, 180, 180), -1)
+    write_jpg(gallery / "square" / "base.jpg", first)
+    write_jpg(gallery / "circle" / "base.jpg", second)
+    settings = Settings(gallery_dir=gallery, cache_dir=tmp_path / "cache")
+    catalog = ImageCatalog.scan(gallery, settings.max_image_pixels)
+    matcher = ImageMatcher(catalog, FeatureIndex.load_or_build(catalog, settings), settings)
+    query = cv2.resize(first[80:240, 80:240], (64, 64))
+
+    result = matcher.match(query)
+
+    assert result.record.parent_name == "square"
+    assert result.method == "phash"
+    assert result.similarity <= 89.9
+
+
+def test_fallback_skips_invalid_and_duplicate_tile_owners(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    records = (
+        ImageRecord("first", Path("first.png"), Path("first.png"), "", "first.png", 1, 1),
+        ImageRecord("second", Path("second.png"), Path("second.png"), "", "second.png", 1, 1),
+    )
+    matcher = ImageMatcher.__new__(ImageMatcher)
+    matcher.catalog = ImageCatalog(Path(), records, ())
+    matcher.index = SimpleNamespace(
+        image_ids=("first", "second"),
+        tiles=TileFeatures(
+            hashes=np.asarray([0, 1, 3, 7], np.uint64),
+            image_indices=np.asarray([99, 0, 0, 1], np.int32),
+            xs=np.zeros(4, np.int32),
+            ys=np.zeros(4, np.int32),
+            sizes=np.full(4, 64, np.int32),
+        ),
+    )
+    matcher.settings = Settings(candidate_count=2)
+    scored_indices: list[int] = []
+
+    def template_score(image_index: int, _query_gray: np.ndarray) -> float:
+        scored_indices.append(image_index)
+        return (0.5, 0.9)[image_index]
+
+    monkeypatch.setattr(matcher, "_template_score", template_score, raising=False)
+
+    result = matcher._fallback(np.zeros((64, 64), np.uint8))
+
+    assert scored_indices == [0, 1]
+    assert result.record.image_id == "second"
+    assert result.method == "phash"
+    assert result.similarity <= 89.9
+
+
+def test_template_score_uses_only_bounded_candidate_levels(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gallery = tmp_path / "songs"
+    source = make_art(9)[:180, :240]
+    write_png(gallery / "one" / "base.png", source)
+    settings = Settings(
+        gallery_dir=gallery,
+        cache_dir=tmp_path / "cache",
+        working_max_edge=160,
+        tile_sizes=(64, 96, 128),
+    )
+    catalog = ImageCatalog.scan(gallery, settings.max_image_pixels)
+    record = catalog.records[0]
+    matcher = ImageMatcher.__new__(ImageMatcher)
+    matcher.catalog = catalog
+    matcher.settings = settings
+    matcher.index = SimpleNamespace(
+        image_ids=(record.image_id,),
+        tiles=TileFeatures(
+            hashes=np.zeros(3, np.uint64),
+            image_indices=np.zeros(3, np.int32),
+            xs=np.zeros(3, np.int32),
+            ys=np.zeros(3, np.int32),
+            sizes=np.asarray(settings.tile_sizes, np.int32),
+        ),
+    )
+    calls: list[tuple[tuple[int, int], tuple[int, int]]] = []
+
+    def match_template(candidate: np.ndarray, query: np.ndarray, method: int) -> np.ndarray:
+        assert method == cv2.TM_CCOEFF_NORMED
+        calls.append((candidate.shape[:2], query.shape[:2]))
+        response_shape = (
+            candidate.shape[0] - query.shape[0] + 1,
+            candidate.shape[1] - query.shape[1] + 1,
+        )
+        return np.zeros(response_shape, np.float32)
+
+    monkeypatch.setattr(cv2, "matchTemplate", match_template)
+    query = cv2.cvtColor(cv2.resize(source[40:120, 60:180], (120, 80)), cv2.COLOR_BGR2GRAY)
+
+    score = matcher._template_score(0, query)
+
+    assert 0.0 <= score <= 1.0
+    assert len(calls) == 4
+    assert all(query_shape == query.shape for _, query_shape in calls)
+    assert all(
+        query.shape[0] <= candidate_shape[0] <= 120 and query.shape[1] <= candidate_shape[1] <= 160
+        for candidate_shape, _ in calls
+    )
 
 
 def test_retrieve_uses_five_neighbors_without_duplicate_owner_votes() -> None:
@@ -300,10 +410,24 @@ def test_match_ranks_by_raw_score_and_applies_bounded_margin(
     assert 0.0 <= result.similarity <= 100.0
 
 
-def test_no_evidence_uses_private_task5_hook() -> None:
+def test_fallback_empty_index_uses_private_error() -> None:
     error_type = getattr(matcher_module, "_NoMatchEvidenceError", None)
 
     assert error_type is not None
     assert not hasattr(matcher_module, "NoMatchEvidenceError")
-    with pytest.raises(error_type, match="No primary geometric match evidence"):
-        ImageMatcher.__new__(ImageMatcher)._fallback(np.zeros((8, 8), np.uint8))
+    matcher = ImageMatcher.__new__(ImageMatcher)
+    matcher.catalog = ImageCatalog(Path(), (), ())
+    matcher.index = SimpleNamespace(
+        image_ids=(),
+        tiles=TileFeatures(
+            hashes=np.empty(0, np.uint64),
+            image_indices=np.empty(0, np.int32),
+            xs=np.empty(0, np.int32),
+            ys=np.empty(0, np.int32),
+            sizes=np.empty(0, np.int32),
+        ),
+    )
+    matcher.settings = Settings()
+
+    with pytest.raises(error_type, match="Fallback index is empty"):
+        matcher._fallback(np.zeros((8, 8), np.uint8))

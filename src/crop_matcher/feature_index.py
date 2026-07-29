@@ -9,9 +9,9 @@ import numpy as np
 
 from crop_matcher.catalog import ImageCatalog
 from crop_matcher.config import Settings
-from crop_matcher.imaging import read_image, resize_to_max, to_gray
+from crop_matcher.imaging import perceptual_hash, read_image, resize_to_max, to_gray
 
-CACHE_SCHEMA_VERSION = 1
+CACHE_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,6 +70,7 @@ class FeatureIndex:
                 "working_max_edge": settings.working_max_edge,
                 "sift_features": settings.sift_features,
                 "sift_contrast_threshold": settings.sift_contrast_threshold,
+                "tile_sizes": list(settings.tile_sizes),
             },
             "images": [asdict(entry) for entry in catalog.manifest],
         }
@@ -104,13 +105,19 @@ class FeatureIndex:
         by_image: dict[str, ImageFeatures] = {}
         descriptor_groups: list[np.ndarray] = []
         descriptor_image_groups: list[np.ndarray] = []
+        tile_hashes: list[np.uint64] = []
+        tile_image_indices: list[int] = []
+        tile_xs: list[int] = []
+        tile_ys: list[int] = []
+        tile_sizes: list[int] = []
 
         for image_index, record in enumerate(catalog.records):
             image, scale = resize_to_max(
                 read_image(record.path, settings.max_image_pixels),
                 settings.working_max_edge,
             )
-            keypoints, descriptors = sift.detectAndCompute(to_gray(image), None)
+            gray = to_gray(image)
+            keypoints, descriptors = sift.detectAndCompute(gray, None)
             if descriptors is None:
                 points = np.empty((0, 2), dtype=np.float32)
                 descriptors = np.empty((0, 128), dtype=np.float32)
@@ -134,6 +141,25 @@ class FeatureIndex:
             descriptor_groups.append(descriptors)
             descriptor_image_groups.append(np.full(len(descriptors), image_index, dtype=np.int32))
 
+            height, width = gray.shape[:2]
+            for size in settings.tile_sizes:
+                if size <= 0 or size > width or size > height:
+                    continue
+                stride = max(1, size // 2)
+                xs = list(range(0, width - size + 1, stride))
+                ys = list(range(0, height - size + 1, stride))
+                if xs[-1] != width - size:
+                    xs.append(width - size)
+                if ys[-1] != height - size:
+                    ys.append(height - size)
+                for y in ys:
+                    for x in xs:
+                        tile_hashes.append(perceptual_hash(gray[y : y + size, x : x + size]))
+                        tile_image_indices.append(image_index)
+                        tile_xs.append(x)
+                        tile_ys.append(y)
+                        tile_sizes.append(size)
+
         all_descriptors = cls._concatenate_rows(descriptor_groups, 128, np.float32)
         if descriptor_image_groups:
             descriptor_image_indices = np.concatenate(descriptor_image_groups).astype(
@@ -147,7 +173,13 @@ class FeatureIndex:
             by_image=by_image,
             descriptors=all_descriptors,
             descriptor_image_indices=descriptor_image_indices,
-            tiles=cls._empty_tiles(),
+            tiles=TileFeatures(
+                hashes=np.asarray(tile_hashes, dtype=np.uint64),
+                image_indices=np.asarray(tile_image_indices, dtype=np.int32),
+                xs=np.asarray(tile_xs, dtype=np.int32),
+                ys=np.asarray(tile_ys, dtype=np.int32),
+                sizes=np.asarray(tile_sizes, dtype=np.int32),
+            ),
             loaded_from_cache=False,
         )
 
@@ -379,6 +411,18 @@ class FeatureIndex:
         tile_owners = arrays["tile_image_indices"]
         if len(tile_owners) and (tile_owners.min() < 0 or tile_owners.max() >= image_count):
             raise ValueError("Cached tile owner is out of range")
+        tile_xs = arrays["tile_xs"].astype(np.int64)
+        tile_ys = arrays["tile_ys"].astype(np.int64)
+        tile_sizes = arrays["tile_sizes"].astype(np.int64)
+        if np.any(tile_xs < 0) or np.any(tile_ys < 0) or np.any(tile_sizes <= 0):
+            raise ValueError("Invalid cached tile geometry")
+        if len(tile_owners):
+            tile_widths = arrays["working_widths"][tile_owners]
+            tile_heights = arrays["working_heights"][tile_owners]
+            if np.any(tile_xs + tile_sizes > tile_widths) or np.any(
+                tile_ys + tile_sizes > tile_heights
+            ):
+                raise ValueError("Cached tile geometry is out of bounds")
 
     @staticmethod
     def _concatenate_rows(groups: list[np.ndarray], width: int, dtype: np.dtype) -> np.ndarray:
