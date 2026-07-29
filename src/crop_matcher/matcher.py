@@ -108,9 +108,10 @@ class ImageMatcher:
     def _retrieve(self, descriptors: np.ndarray) -> list[str]:
         target_count = min(self.settings.candidate_count, len(self.index.image_ids))
         matches_by_descriptor = []
-        if len(self.index.descriptors):
+        k = min(5, len(self.index.descriptors))
+        if k >= 2:
             with self._flann_lock:
-                matches_by_descriptor = self.index.global_matcher.knnMatch(descriptors, k=5)
+                matches_by_descriptor = self.index.global_matcher.knnMatch(descriptors, k=k)
 
         votes: dict[int, float] = defaultdict(float)
         for matches in matches_by_descriptor:

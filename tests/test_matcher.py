@@ -56,6 +56,21 @@ class FakeGlobalMatcher:
         return self.matches
 
 
+class RecordingGlobalMatcher:
+    def __init__(self, descriptors: np.ndarray) -> None:
+        self.matcher = cv2.FlannBasedMatcher(
+            {"algorithm": 1, "trees": 5},
+            {"checks": 64},
+        )
+        self.matcher.add([descriptors])
+        self.matcher.train()
+        self.requested_k: int | None = None
+
+    def knnMatch(self, descriptors: np.ndarray, k: int) -> list[list[cv2.DMatch]]:
+        self.requested_k = k
+        return self.matcher.knnMatch(descriptors, k=k)
+
+
 def neighbor(train_index: int, distance: float) -> SimpleNamespace:
     return SimpleNamespace(trainIdx=train_index, distance=distance)
 
@@ -157,6 +172,41 @@ def test_retrieve_ignores_unsafe_owners_and_deterministically_fills() -> None:
 
     assert result == ["image-2", "image-0", "image-1", "image-3"]
     assert len(result) == len(set(result)) == 4
+
+
+@pytest.mark.parametrize(
+    ("descriptor_count", "expected_k", "expected"),
+    [
+        (1, None, ["image-0", "image-1", "image-2"]),
+        (2, 2, ["image-2", "image-0", "image-1"]),
+        (3, 3, ["image-2", "image-3", "image-0"]),
+        (4, 4, ["image-2", "image-3", "image-4"]),
+    ],
+)
+def test_retrieve_caps_knn_to_available_descriptor_rows(
+    descriptor_count: int, expected_k: int | None, expected: list[str]
+) -> None:
+    descriptors = np.repeat(
+        (10.0 * np.arange(descriptor_count, dtype=np.float32))[:, None],
+        128,
+        axis=1,
+    )
+    global_matcher = RecordingGlobalMatcher(descriptors)
+    matcher = ImageMatcher.__new__(ImageMatcher)
+    matcher.index = SimpleNamespace(
+        descriptors=descriptors,
+        descriptor_image_indices=np.asarray([2, 3, 4, 1][:descriptor_count], np.int32),
+        image_ids=tuple(f"image-{index}" for index in range(5)),
+        global_matcher=global_matcher,
+    )
+    matcher.settings = Settings(candidate_count=3)
+    matcher._flann_lock = Lock()
+
+    result = matcher._retrieve(descriptors[:1])
+
+    assert global_matcher.requested_k == expected_k
+    assert result == expected
+    assert len(result) == len(set(result)) == 3
 
 
 def test_verify_accepts_large_scale_from_downscaled_candidate(
