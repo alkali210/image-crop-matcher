@@ -10,6 +10,8 @@ from crop_matcher.catalog import ImageCatalog
 from crop_matcher.config import Settings
 from crop_matcher.imaging import read_image, resize_to_max, to_gray
 
+CACHE_SCHEMA_VERSION = 1
+
 
 @dataclass(frozen=True, slots=True)
 class ImageFeatures:
@@ -60,13 +62,26 @@ class FeatureIndex:
         settings.cache_dir.mkdir(parents=True, exist_ok=True)
         manifest_path = settings.cache_dir / "manifest.json"
         index_path = settings.cache_dir / "features.npz"
-        manifest = [asdict(entry) for entry in catalog.manifest]
+        expected_image_ids = tuple(record.image_id for record in catalog.records)
+        metadata = {
+            "schema_version": CACHE_SCHEMA_VERSION,
+            "feature_settings": {
+                "working_max_edge": settings.working_max_edge,
+                "sift_features": settings.sift_features,
+                "sift_contrast_threshold": settings.sift_contrast_threshold,
+            },
+            "images": [asdict(entry) for entry in catalog.manifest],
+        }
         if manifest_path.exists() and index_path.exists():
-            if json.loads(manifest_path.read_text("utf-8")) == manifest:
-                return cls._load(index_path)
+            try:
+                if json.loads(manifest_path.read_text("utf-8")) == metadata:
+                    return cls._load(index_path, expected_image_ids)
+            except Exception:
+                # Cache data is disposable; source-image build errors remain outside this block.
+                pass
         index = cls._build(catalog, settings)
         index._save(index_path)
-        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False), "utf-8")
+        cls._save_manifest(manifest_path, metadata)
         return index
 
     @classmethod
@@ -175,25 +190,65 @@ class FeatureIndex:
             if temporary_path is not None:
                 temporary_path.unlink(missing_ok=True)
 
+    @staticmethod
+    def _save_manifest(manifest_path: Path, metadata: dict[str, object]) -> None:
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                prefix=f"{manifest_path.stem}.",
+                suffix=".tmp.json",
+                dir=manifest_path.parent,
+                delete=False,
+            ) as temporary:
+                temporary_path = Path(temporary.name)
+                temporary.write(json.dumps(metadata, ensure_ascii=False))
+            temporary_path.replace(manifest_path)
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+
     @classmethod
-    def _load(cls, index_path: Path) -> "FeatureIndex":
+    def _load(cls, index_path: Path, expected_image_ids: tuple[str, ...]) -> "FeatureIndex":
         with np.load(index_path, allow_pickle=False) as cache:
-            image_ids = tuple(str(image_id) for image_id in cache["image_ids"])
-            points = np.asarray(cache["points"], dtype=np.float32)
-            point_offsets = np.asarray(cache["point_offsets"], dtype=np.int64)
-            descriptors = np.asarray(cache["descriptors"], dtype=np.float32)
-            descriptor_offsets = np.asarray(cache["descriptor_offsets"], dtype=np.int64)
-            working_widths = np.asarray(cache["working_widths"], dtype=np.int32)
-            working_heights = np.asarray(cache["working_heights"], dtype=np.int32)
-            working_scales = np.asarray(cache["working_scales"], dtype=np.float64)
-            descriptor_image_indices = np.asarray(cache["descriptor_image_indices"], dtype=np.int32)
-            tiles = TileFeatures(
-                hashes=np.asarray(cache["tile_hashes"], dtype=np.uint64),
-                image_indices=np.asarray(cache["tile_image_indices"], dtype=np.int32),
-                xs=np.asarray(cache["tile_xs"], dtype=np.int32),
-                ys=np.asarray(cache["tile_ys"], dtype=np.int32),
-                sizes=np.asarray(cache["tile_sizes"], dtype=np.int32),
-            )
+            arrays = {
+                name: cache[name]
+                for name in (
+                    "image_ids",
+                    "points",
+                    "point_offsets",
+                    "descriptors",
+                    "descriptor_offsets",
+                    "working_widths",
+                    "working_heights",
+                    "working_scales",
+                    "descriptor_image_indices",
+                    "tile_hashes",
+                    "tile_image_indices",
+                    "tile_xs",
+                    "tile_ys",
+                    "tile_sizes",
+                )
+            }
+        cls._validate_archive(arrays, expected_image_ids)
+
+        image_ids = tuple(str(image_id) for image_id in arrays["image_ids"])
+        points = arrays["points"]
+        point_offsets = arrays["point_offsets"]
+        descriptors = arrays["descriptors"]
+        descriptor_offsets = arrays["descriptor_offsets"]
+        working_widths = arrays["working_widths"]
+        working_heights = arrays["working_heights"]
+        working_scales = arrays["working_scales"]
+        descriptor_image_indices = arrays["descriptor_image_indices"]
+        tiles = TileFeatures(
+            hashes=np.ascontiguousarray(arrays["tile_hashes"]),
+            image_indices=np.ascontiguousarray(arrays["tile_image_indices"]),
+            xs=np.ascontiguousarray(arrays["tile_xs"]),
+            ys=np.ascontiguousarray(arrays["tile_ys"]),
+            sizes=np.ascontiguousarray(arrays["tile_sizes"]),
+        )
 
         by_image: dict[str, ImageFeatures] = {}
         for image_index, image_id in enumerate(image_ids):
@@ -217,6 +272,87 @@ class FeatureIndex:
             tiles=tiles,
             loaded_from_cache=True,
         )
+
+    @staticmethod
+    def _validate_archive(
+        arrays: dict[str, np.ndarray], expected_image_ids: tuple[str, ...]
+    ) -> None:
+        expected_dtypes = {
+            "points": np.dtype(np.float32),
+            "point_offsets": np.dtype(np.int64),
+            "descriptors": np.dtype(np.float32),
+            "descriptor_offsets": np.dtype(np.int64),
+            "working_widths": np.dtype(np.int32),
+            "working_heights": np.dtype(np.int32),
+            "working_scales": np.dtype(np.float64),
+            "descriptor_image_indices": np.dtype(np.int32),
+            "tile_hashes": np.dtype(np.uint64),
+            "tile_image_indices": np.dtype(np.int32),
+            "tile_xs": np.dtype(np.int32),
+            "tile_ys": np.dtype(np.int32),
+            "tile_sizes": np.dtype(np.int32),
+        }
+        if arrays["image_ids"].ndim != 1 or arrays["image_ids"].dtype.kind != "U":
+            raise ValueError("Invalid cached image IDs")
+        for name, dtype in expected_dtypes.items():
+            if arrays[name].dtype != dtype:
+                raise ValueError(f"Invalid dtype for cached {name}")
+
+        image_count = len(arrays["image_ids"])
+        metadata_names = ("working_widths", "working_heights", "working_scales")
+        if any(arrays[name].shape != (image_count,) for name in metadata_names):
+            raise ValueError("Invalid cached per-image metadata")
+        if len(set(str(image_id) for image_id in arrays["image_ids"])) != image_count:
+            raise ValueError("Duplicate cached image IDs")
+        if tuple(str(image_id) for image_id in arrays["image_ids"]) != expected_image_ids:
+            raise ValueError("Cached image IDs do not match the catalog")
+        if arrays["points"].ndim != 2 or arrays["points"].shape[1] != 2:
+            raise ValueError("Invalid cached points")
+        if arrays["descriptors"].ndim != 2 or arrays["descriptors"].shape[1] != 128:
+            raise ValueError("Invalid cached descriptors")
+
+        point_offsets = arrays["point_offsets"]
+        descriptor_offsets = arrays["descriptor_offsets"]
+        if point_offsets.shape != (image_count + 1,) or descriptor_offsets.shape != (
+            image_count + 1,
+        ):
+            raise ValueError("Invalid cached offset count")
+        if (
+            point_offsets[0] != 0
+            or descriptor_offsets[0] != 0
+            or np.any(np.diff(point_offsets) < 0)
+            or np.any(np.diff(descriptor_offsets) < 0)
+        ):
+            raise ValueError("Invalid cached offsets")
+        if point_offsets[-1] != len(arrays["points"]) or descriptor_offsets[-1] != len(
+            arrays["descriptors"]
+        ):
+            raise ValueError("Invalid cached terminal offsets")
+        if not np.array_equal(np.diff(point_offsets), np.diff(descriptor_offsets)):
+            raise ValueError("Cached point and descriptor rows differ")
+
+        descriptor_owners = arrays["descriptor_image_indices"]
+        if descriptor_owners.shape != (len(arrays["descriptors"]),):
+            raise ValueError("Invalid cached descriptor owners")
+        if len(descriptor_owners) and (
+            descriptor_owners.min() < 0 or descriptor_owners.max() >= image_count
+        ):
+            raise ValueError("Cached descriptor owner is out of range")
+        expected_owners = np.repeat(
+            np.arange(image_count, dtype=np.int32), np.diff(descriptor_offsets)
+        )
+        if not np.array_equal(descriptor_owners, expected_owners):
+            raise ValueError("Cached descriptor owners do not match offsets")
+
+        tile_names = ("tile_hashes", "tile_image_indices", "tile_xs", "tile_ys", "tile_sizes")
+        if any(arrays[name].ndim != 1 for name in tile_names):
+            raise ValueError("Invalid cached tile arrays")
+        tile_count = len(arrays["tile_hashes"])
+        if any(len(arrays[name]) != tile_count for name in tile_names[1:]):
+            raise ValueError("Cached tile array lengths differ")
+        tile_owners = arrays["tile_image_indices"]
+        if len(tile_owners) and (tile_owners.min() < 0 or tile_owners.max() >= image_count):
+            raise ValueError("Cached tile owner is out of range")
 
     @staticmethod
     def _concatenate_rows(groups: list[np.ndarray], width: int, dtype: np.dtype) -> np.ndarray:

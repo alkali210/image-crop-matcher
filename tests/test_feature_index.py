@@ -1,3 +1,5 @@
+from dataclasses import replace
+import json
 from pathlib import Path
 
 import cv2
@@ -65,6 +67,116 @@ def test_manifest_change_invalidates_cache(tmp_path: Path) -> None:
     second_catalog = ImageCatalog.scan(gallery, settings.max_image_pixels)
     rebuilt = FeatureIndex.load_or_build(second_catalog, settings)
     assert rebuilt.loaded_from_cache is False
+
+
+@pytest.mark.parametrize(
+    ("setting_name", "changed_value"),
+    [
+        ("working_max_edge", 96),
+        ("sift_features", 25),
+        ("sift_contrast_threshold", 0.08),
+    ],
+)
+def test_feature_setting_change_invalidates_cache(
+    tmp_path: Path, setting_name: str, changed_value: int | float
+) -> None:
+    gallery = tmp_path / "songs"
+    write_textured_image(gallery / "one" / "base.jpg", 0)
+    settings = Settings(gallery_dir=gallery, cache_dir=tmp_path / "cache")
+    catalog = ImageCatalog.scan(gallery, settings.max_image_pixels)
+    FeatureIndex.load_or_build(catalog, settings)
+
+    changed_settings = replace(settings, **{setting_name: changed_value})
+    rebuilt = FeatureIndex.load_or_build(catalog, changed_settings)
+
+    assert rebuilt.loaded_from_cache is False
+    metadata = json.loads((settings.cache_dir / "manifest.json").read_text("utf-8"))
+    assert isinstance(metadata["schema_version"], int)
+    assert metadata["feature_settings"][setting_name] == changed_value
+
+
+def test_malformed_manifest_is_rebuilt_and_replaced(tmp_path: Path) -> None:
+    gallery = tmp_path / "songs"
+    write_textured_image(gallery / "one" / "base.jpg", 0)
+    settings = Settings(gallery_dir=gallery, cache_dir=tmp_path / "cache")
+    catalog = ImageCatalog.scan(gallery, settings.max_image_pixels)
+    FeatureIndex.load_or_build(catalog, settings)
+    manifest_path = settings.cache_dir / "manifest.json"
+    manifest_path.write_text("{not-json", "utf-8")
+
+    rebuilt = FeatureIndex.load_or_build(catalog, settings)
+
+    assert rebuilt.loaded_from_cache is False
+    assert json.loads(manifest_path.read_text("utf-8"))["images"]
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "malformed_npz",
+        "malformed_zip",
+        "missing_array",
+        "bad_offsets",
+        "bad_descriptor_owner",
+        "wrong_image_ids",
+    ],
+)
+def test_corrupt_feature_cache_is_rebuilt(tmp_path: Path, corruption: str) -> None:
+    gallery = tmp_path / "songs"
+    write_textured_image(gallery / "one" / "base.jpg", 0)
+    settings = Settings(gallery_dir=gallery, cache_dir=tmp_path / "cache")
+    catalog = ImageCatalog.scan(gallery, settings.max_image_pixels)
+    FeatureIndex.load_or_build(catalog, settings)
+    cache_path = settings.cache_dir / "features.npz"
+
+    if corruption == "malformed_npz":
+        cache_path.write_bytes(b"not-an-npz")
+    elif corruption == "malformed_zip":
+        cache_path.write_bytes(b"PK\x03\x04broken")
+    else:
+        with np.load(cache_path, allow_pickle=False) as cache:
+            arrays = {name: cache[name] for name in cache.files}
+        if corruption == "missing_array":
+            del arrays["working_scales"]
+        elif corruption == "bad_offsets":
+            arrays["point_offsets"][-1] += 1
+        elif corruption == "bad_descriptor_owner":
+            arrays["descriptor_image_indices"][:] = len(catalog.records)
+        else:
+            arrays["image_ids"][:] = "wrong-image-id"
+        np.savez(cache_path, **arrays)
+
+    rebuilt = FeatureIndex.load_or_build(catalog, settings)
+    loaded = FeatureIndex.load_or_build(catalog, settings)
+
+    assert rebuilt.loaded_from_cache is False
+    assert loaded.loaded_from_cache is True
+
+
+def test_failed_manifest_save_preserves_existing_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gallery = tmp_path / "songs"
+    write_textured_image(gallery / "one" / "base.jpg", 0)
+    settings = Settings(gallery_dir=gallery, cache_dir=tmp_path / "cache")
+    catalog = ImageCatalog.scan(gallery, settings.max_image_pixels)
+    FeatureIndex.load_or_build(catalog, settings)
+    manifest_path = settings.cache_dir / "manifest.json"
+    original_manifest = manifest_path.read_bytes()
+    original_replace = Path.replace
+
+    def fail_manifest_replace(source: Path, target: Path) -> Path:
+        if source.name.endswith(".tmp.json"):
+            raise RuntimeError("manifest replace failed")
+        return original_replace(source, target)
+
+    monkeypatch.setattr(Path, "replace", fail_manifest_replace)
+
+    with pytest.raises(RuntimeError, match="manifest replace failed"):
+        FeatureIndex.load_or_build(catalog, replace(settings, working_max_edge=96))
+
+    assert manifest_path.read_bytes() == original_manifest
+    assert list(settings.cache_dir.glob("*.tmp.json")) == []
 
 
 def test_preserves_per_image_features_and_descriptor_mapping(tmp_path: Path) -> None:
