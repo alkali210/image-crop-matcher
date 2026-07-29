@@ -11,7 +11,7 @@ from crop_matcher.feature_index import FeatureIndex
 from crop_matcher.imaging import gradient_magnitude, normalized_correlation, read_image, to_gray
 
 
-class NoMatchEvidenceError(RuntimeError):
+class _NoMatchEvidenceError(RuntimeError):
     pass
 
 
@@ -106,25 +106,41 @@ class ImageMatcher:
         return cv2.resize(query_gray, size, interpolation=cv2.INTER_CUBIC), scale
 
     def _retrieve(self, descriptors: np.ndarray) -> list[str]:
-        if not len(self.index.descriptors):
-            return []
-        with self._flann_lock:
-            matches_by_descriptor = self.index.global_matcher.knnMatch(descriptors, k=5)
+        target_count = min(self.settings.candidate_count, len(self.index.image_ids))
+        matches_by_descriptor = []
+        if len(self.index.descriptors):
+            with self._flann_lock:
+                matches_by_descriptor = self.index.global_matcher.knnMatch(descriptors, k=5)
 
         votes: dict[int, float] = defaultdict(float)
         for matches in matches_by_descriptor:
-            if len(matches) < 2 or matches[0].distance >= 0.78 * matches[1].distance:
-                continue
-            best = matches[0]
-            image_index = int(self.index.descriptor_image_indices[best.trainIdx])
-            ratio = best.distance / max(matches[1].distance, np.finfo(np.float32).eps)
-            votes[image_index] += 1.0 - ratio
+            voted_owners: set[int] = set()
+            for rank, (match, next_match) in enumerate(zip(matches, matches[1:])):
+                if (
+                    not np.isfinite(match.distance)
+                    or not np.isfinite(next_match.distance)
+                    or next_match.distance <= 0.0
+                    or match.distance >= 0.78 * next_match.distance
+                ):
+                    continue
+                descriptor_index = int(match.trainIdx)
+                if not 0 <= descriptor_index < len(self.index.descriptor_image_indices):
+                    continue
+                image_index = int(self.index.descriptor_image_indices[descriptor_index])
+                if not 0 <= image_index < len(self.index.image_ids) or image_index in voted_owners:
+                    continue
+                ratio = max(0.0, match.distance) / next_match.distance
+                votes[image_index] += (1.0 - ratio) / (rank + 1)
+                voted_owners.add(image_index)
 
         ranked_indices = sorted(votes, key=lambda index: (-votes[index], index))
-        return [
-            self.index.image_ids[image_index]
-            for image_index in ranked_indices[: self.settings.candidate_count]
-        ]
+        ranked_set = set(ranked_indices)
+        ranked_indices.extend(
+            image_index
+            for image_index in range(len(self.index.image_ids))
+            if image_index not in ranked_set
+        )
+        return [self.index.image_ids[index] for index in ranked_indices[:target_count]]
 
     def _verify(
         self,
@@ -184,13 +200,18 @@ class ImageMatcher:
             return None
 
         affine_scale = float(np.hypot(query_to_candidate[0, 0], query_to_candidate[0, 1]))
-        if not 0.05 <= affine_scale <= 20.0:
+        if affine_scale < 0.05:
             return None
 
         record = self.catalog.get(image_id)
         query_height, query_width = query_gray.shape[:2]
         corners = np.asarray(
-            [[0.0, 0.0], [query_width - 1.0, 0.0], [query_width - 1.0, query_height - 1.0], [0.0, query_height - 1.0]],
+            [
+                [0.0, 0.0],
+                [query_width - 1.0, 0.0],
+                [query_width - 1.0, query_height - 1.0],
+                [0.0, query_height - 1.0],
+            ],
             dtype=np.float64,
         )
         mapped_corners = cv2.transform(corners[None, :, :], query_to_candidate)[0]
@@ -234,14 +255,15 @@ class ImageMatcher:
     ) -> bool:
         if mapped_corners.shape != (4, 2) or not np.isfinite(mapped_corners).all():
             return False
-        tolerance = 0.05 * max(candidate_width, candidate_height)
+        x_tolerance = 0.05 * candidate_width
+        y_tolerance = 0.05 * candidate_height
         xs = mapped_corners[:, 0]
         ys = mapped_corners[:, 1]
         return bool(
-            np.all(xs >= -tolerance)
-            and np.all(xs <= candidate_width - 1 + tolerance)
-            and np.all(ys >= -tolerance)
-            and np.all(ys <= candidate_height - 1 + tolerance)
+            np.all(xs >= -x_tolerance)
+            and np.all(xs <= candidate_width - 1 + x_tolerance)
+            and np.all(ys >= -y_tolerance)
+            and np.all(ys <= candidate_height - 1 + y_tolerance)
             and abs(cv2.contourArea(mapped_corners.astype(np.float32))) > 1.0
         )
 
@@ -250,4 +272,4 @@ class ImageMatcher:
         return float(np.clip((normalized_correlation(left, right) + 1.0) / 2.0, 0.0, 1.0))
 
     def _fallback(self, query_gray: np.ndarray) -> MatchResult:
-        raise NoMatchEvidenceError("No primary geometric match evidence")
+        raise _NoMatchEvidenceError("No primary geometric match evidence")
