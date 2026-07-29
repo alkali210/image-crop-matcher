@@ -119,6 +119,7 @@ def test_malformed_manifest_is_rebuilt_and_replaced(tmp_path: Path) -> None:
         "bad_offsets",
         "bad_descriptor_owner",
         "wrong_image_ids",
+        "wrong_cache_identity",
     ],
 )
 def test_corrupt_feature_cache_is_rebuilt(tmp_path: Path, corruption: str) -> None:
@@ -142,8 +143,10 @@ def test_corrupt_feature_cache_is_rebuilt(tmp_path: Path, corruption: str) -> No
             arrays["point_offsets"][-1] += 1
         elif corruption == "bad_descriptor_owner":
             arrays["descriptor_image_indices"][:] = len(catalog.records)
-        else:
+        elif corruption == "wrong_image_ids":
             arrays["image_ids"][:] = "wrong-image-id"
+        else:
+            arrays["cache_identity"] = np.asarray("wrong-cache-identity")
         np.savez(cache_path, **arrays)
 
     rebuilt = FeatureIndex.load_or_build(catalog, settings)
@@ -160,7 +163,7 @@ def test_failed_manifest_save_preserves_existing_manifest(
     write_textured_image(gallery / "one" / "base.jpg", 0)
     settings = Settings(gallery_dir=gallery, cache_dir=tmp_path / "cache")
     catalog = ImageCatalog.scan(gallery, settings.max_image_pixels)
-    FeatureIndex.load_or_build(catalog, settings)
+    original_index = FeatureIndex.load_or_build(catalog, settings)
     manifest_path = settings.cache_dir / "manifest.json"
     original_manifest = manifest_path.read_bytes()
     original_replace = Path.replace
@@ -177,6 +180,12 @@ def test_failed_manifest_save_preserves_existing_manifest(
 
     assert manifest_path.read_bytes() == original_manifest
     assert list(settings.cache_dir.glob("*.tmp.json")) == []
+
+    monkeypatch.undo()
+    rebuilt = FeatureIndex.load_or_build(catalog, settings)
+
+    assert rebuilt.loaded_from_cache is False
+    assert np.array_equal(rebuilt.descriptors, original_index.descriptors)
 
 
 def test_preserves_per_image_features_and_descriptor_mapping(tmp_path: Path) -> None:
@@ -232,6 +241,10 @@ def test_cache_contains_only_non_object_flattened_arrays(tmp_path: Path) -> None
         assert cache["image_ids"].dtype.kind == "U"
         assert cache["point_offsets"].dtype == np.int64
         assert cache["descriptor_offsets"].dtype == np.int64
+        assert cache["cache_identity"].dtype.kind == "U"
+        assert cache["cache_identity"].shape == ()
+        metadata = json.loads((settings.cache_dir / "manifest.json").read_text("utf-8"))
+        assert cache["cache_identity"].item() == metadata["cache_identity"]
 
 
 def test_empty_catalog_round_trips_typed_empty_arrays(tmp_path: Path) -> None:

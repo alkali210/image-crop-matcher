@@ -1,4 +1,5 @@
 from dataclasses import asdict, dataclass
+from hashlib import sha256
 import json
 from pathlib import Path
 import tempfile
@@ -63,7 +64,7 @@ class FeatureIndex:
         manifest_path = settings.cache_dir / "manifest.json"
         index_path = settings.cache_dir / "features.npz"
         expected_image_ids = tuple(record.image_id for record in catalog.records)
-        metadata = {
+        identity_source = {
             "schema_version": CACHE_SCHEMA_VERSION,
             "feature_settings": {
                 "working_max_edge": settings.working_max_edge,
@@ -72,15 +73,24 @@ class FeatureIndex:
             },
             "images": [asdict(entry) for entry in catalog.manifest],
         }
+        cache_identity = sha256(
+            json.dumps(
+                identity_source,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        metadata = {**identity_source, "cache_identity": cache_identity}
         if manifest_path.exists() and index_path.exists():
             try:
                 if json.loads(manifest_path.read_text("utf-8")) == metadata:
-                    return cls._load(index_path, expected_image_ids)
+                    return cls._load(index_path, expected_image_ids, cache_identity)
             except Exception:
                 # Cache data is disposable; source-image build errors remain outside this block.
                 pass
         index = cls._build(catalog, settings)
-        index._save(index_path)
+        index._save(index_path, cache_identity)
         cls._save_manifest(manifest_path, metadata)
         return index
 
@@ -141,7 +151,7 @@ class FeatureIndex:
             loaded_from_cache=False,
         )
 
-    def _save(self, index_path: Path) -> None:
+    def _save(self, index_path: Path, cache_identity: str) -> None:
         point_groups = [self.by_image[image_id].points for image_id in self.image_ids]
         descriptor_groups = [self.by_image[image_id].descriptors for image_id in self.image_ids]
         points = self._concatenate_rows(point_groups, 2, np.float32)
@@ -151,6 +161,7 @@ class FeatureIndex:
         id_width = max((len(image_id) for image_id in self.image_ids), default=1)
 
         arrays = {
+            "cache_identity": np.asarray(cache_identity, dtype=f"<U{len(cache_identity)}"),
             "image_ids": np.asarray(self.image_ids, dtype=f"<U{id_width}"),
             "points": points,
             "point_offsets": point_offsets,
@@ -210,11 +221,17 @@ class FeatureIndex:
                 temporary_path.unlink(missing_ok=True)
 
     @classmethod
-    def _load(cls, index_path: Path, expected_image_ids: tuple[str, ...]) -> "FeatureIndex":
+    def _load(
+        cls,
+        index_path: Path,
+        expected_image_ids: tuple[str, ...],
+        expected_cache_identity: str,
+    ) -> "FeatureIndex":
         with np.load(index_path, allow_pickle=False) as cache:
             arrays = {
                 name: cache[name]
                 for name in (
+                    "cache_identity",
                     "image_ids",
                     "points",
                     "point_offsets",
@@ -231,7 +248,7 @@ class FeatureIndex:
                     "tile_sizes",
                 )
             }
-        cls._validate_archive(arrays, expected_image_ids)
+        cls._validate_archive(arrays, expected_image_ids, expected_cache_identity)
 
         image_ids = tuple(str(image_id) for image_id in arrays["image_ids"])
         points = arrays["points"]
@@ -275,7 +292,9 @@ class FeatureIndex:
 
     @staticmethod
     def _validate_archive(
-        arrays: dict[str, np.ndarray], expected_image_ids: tuple[str, ...]
+        arrays: dict[str, np.ndarray],
+        expected_image_ids: tuple[str, ...],
+        expected_cache_identity: str,
     ) -> None:
         expected_dtypes = {
             "points": np.dtype(np.float32),
@@ -292,6 +311,13 @@ class FeatureIndex:
             "tile_ys": np.dtype(np.int32),
             "tile_sizes": np.dtype(np.int32),
         }
+        cache_identity = arrays["cache_identity"]
+        if (
+            cache_identity.shape != ()
+            or cache_identity.dtype.kind != "U"
+            or str(cache_identity.item()) != expected_cache_identity
+        ):
+            raise ValueError("Cached identity does not match metadata")
         if arrays["image_ids"].ndim != 1 or arrays["image_ids"].dtype.kind != "U":
             raise ValueError("Invalid cached image IDs")
         for name, dtype in expected_dtypes.items():
