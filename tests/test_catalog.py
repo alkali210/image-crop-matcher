@@ -31,6 +31,22 @@ def test_scan_is_sorted_filters_thumbnails_and_skips_corrupt_files(tmp_path: Pat
     assert catalog.get(catalog.records[0].image_id) == catalog.records[0]
 
 
+def test_scan_breaks_casefold_sort_ties_with_original_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sharp_s_path = tmp_path / "ß.jpg"
+    double_s_path = tmp_path / "ss.jpg"
+    write_image(sharp_s_path, 20)
+    write_image(double_s_path, 30)
+    monkeypatch.setattr(Path, "rglob", lambda _root, _pattern: iter([sharp_s_path, double_s_path]))
+
+    catalog = ImageCatalog.scan(tmp_path, max_pixels=10_000)
+
+    expected = ["ss.jpg", "ß.jpg"]
+    assert [record.relative_path.as_posix() for record in catalog.records] == expected
+    assert [entry.relative_path for entry in catalog.manifest] == expected
+
+
 def test_ids_are_stable_and_unknown_ids_do_not_resolve(tmp_path: Path) -> None:
     write_image(tmp_path / "song" / "base.jpg")
     first = ImageCatalog.scan(tmp_path, max_pixels=10_000)

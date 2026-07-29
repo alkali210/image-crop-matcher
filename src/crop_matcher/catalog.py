@@ -50,7 +50,10 @@ class ImageCatalog:
                 and path.suffix.lower() in SUPPORTED_EXTENSIONS
                 and not path.stem.lower().endswith("_256")
             ),
-            key=lambda path: path.relative_to(root).as_posix().casefold(),
+            key=lambda path: (
+                path.relative_to(root).as_posix().casefold(),
+                path.relative_to(root).as_posix(),
+            ),
         )
         for path in paths:
             relative = path.relative_to(root)
