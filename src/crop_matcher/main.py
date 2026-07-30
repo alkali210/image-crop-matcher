@@ -8,7 +8,6 @@ from threading import Lock
 import time
 from typing import Literal
 
-import cv2
 from fastapi import FastAPI, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
@@ -187,13 +186,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise ApiError(400, "invalid_image", str(exc)) from None
         except ImageTooLargeError as exc:
             raise ApiError(413, "image_too_large", str(exc)) from None
-        except cv2.error:
-            raise ApiError(
-                400,
-                "invalid_image",
-                "The uploaded file is not a supported image",
-            ) from None
-
         snapshot = services.snapshot()
         if snapshot.state != "ready" or snapshot.matcher is None:
             raise ApiError(503, "service_unavailable", "The image index is not ready")

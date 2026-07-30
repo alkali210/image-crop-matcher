@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from hashlib import blake2s
 from pathlib import Path
 
@@ -32,7 +32,7 @@ class ImageCatalog:
         records: tuple[ImageRecord, ...],
         manifest: tuple[CatalogManifestEntry, ...],
     ) -> None:
-        self.root = root
+        self.root = root.resolve()
         self.records = records
         self.manifest = manifest
         self._by_id = {record.image_id: record for record in records}
@@ -58,10 +58,11 @@ class ImageCatalog:
         for path in paths:
             relative = path.relative_to(root)
             try:
-                image = read_image(path, max_pixels)
-            except (ImageDecodeError, ImageTooLargeError):
+                resolved_path = cls._resolve_contained_path(root, path)
+                image = read_image(resolved_path, max_pixels)
+                stat = resolved_path.stat()
+            except (ImageDecodeError, ImageTooLargeError, KeyError, OSError):
                 continue
-            stat = path.stat()
             normalized = relative.as_posix()
             records.append(
                 ImageRecord(
@@ -78,4 +79,16 @@ class ImageCatalog:
         return cls(root, tuple(records), tuple(manifest))
 
     def get(self, image_id: str) -> ImageRecord:
-        return self._by_id[image_id]
+        record = self._by_id[image_id]
+        return replace(record, path=self._resolve_contained_path(self.root, record.path))
+
+    @staticmethod
+    def _resolve_contained_path(root: Path, path: Path) -> Path:
+        try:
+            resolved = path.resolve(strict=True)
+            resolved.relative_to(root)
+            if not resolved.is_file():
+                raise KeyError(path)
+        except (OSError, ValueError) as exc:
+            raise KeyError(path) from exc
+        return resolved

@@ -14,6 +14,13 @@ def write_image(path: Path, value: int = 80) -> None:
     path.write_bytes(payload.tobytes())
 
 
+def create_symlink_or_skip(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target)
+    except OSError as exc:
+        pytest.skip(f"file symlinks are unavailable: {exc}")
+
+
 def test_scan_is_sorted_filters_thumbnails_and_skips_corrupt_files(tmp_path: Path) -> None:
     write_image(tmp_path / "z-song" / "cover.PNG", 20)
     write_image(tmp_path / "a-song" / "base.jpg", 30)
@@ -29,6 +36,28 @@ def test_scan_is_sorted_filters_thumbnails_and_skips_corrupt_files(tmp_path: Pat
     ]
     assert catalog.records[0].parent_name == "a-song"
     assert catalog.get(catalog.records[0].image_id) == catalog.records[0]
+
+
+def test_scan_skips_opencv_decode_failure_and_keeps_valid_peers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    broken = tmp_path / "a-broken.png"
+    valid = tmp_path / "b-valid.png"
+    write_image(broken, 20)
+    write_image(valid, 30)
+    broken_payload = broken.read_bytes()
+    original_imdecode = cv2.imdecode
+
+    def selective_decode(data: np.ndarray, flags: int) -> np.ndarray:
+        if data.tobytes() == broken_payload:
+            raise cv2.error("OpenCV decode failed")
+        return original_imdecode(data, flags)
+
+    monkeypatch.setattr(cv2, "imdecode", selective_decode)
+
+    catalog = ImageCatalog.scan(tmp_path, max_pixels=10_000)
+
+    assert [record.relative_path.as_posix() for record in catalog.records] == ["b-valid.png"]
 
 
 def test_scan_breaks_casefold_sort_ties_with_original_path(
@@ -54,3 +83,42 @@ def test_ids_are_stable_and_unknown_ids_do_not_resolve(tmp_path: Path) -> None:
     assert first.records[0].image_id == second.records[0].image_id
     with pytest.raises(KeyError):
         first.get("../../outside")
+
+
+def test_get_rejects_record_whose_resolved_path_is_outside_root(tmp_path: Path) -> None:
+    gallery = tmp_path / "gallery"
+    gallery.mkdir()
+    outside = tmp_path / "outside.png"
+    write_image(outside)
+    record = ImageCatalog.scan(tmp_path, max_pixels=10_000).records[0]
+    catalog = ImageCatalog(gallery, (record,), ())
+
+    with pytest.raises(KeyError):
+        catalog.get(record.image_id)
+
+
+def test_scan_skips_external_file_symlink(tmp_path: Path) -> None:
+    gallery = tmp_path / "gallery"
+    gallery.mkdir()
+    outside = tmp_path / "outside.png"
+    write_image(outside)
+    create_symlink_or_skip(gallery / "linked.png", outside)
+
+    catalog = ImageCatalog.scan(gallery, max_pixels=10_000)
+
+    assert catalog.records == ()
+
+
+def test_get_rejects_file_symlink_replaced_after_scan(tmp_path: Path) -> None:
+    gallery = tmp_path / "gallery"
+    source = gallery / "source.png"
+    outside = tmp_path / "outside.png"
+    write_image(source, 20)
+    write_image(outside, 30)
+    catalog = ImageCatalog.scan(gallery, max_pixels=10_000)
+    image_id = catalog.records[0].image_id
+    source.unlink()
+    create_symlink_or_skip(source, outside)
+
+    with pytest.raises(KeyError):
+        catalog.get(image_id)

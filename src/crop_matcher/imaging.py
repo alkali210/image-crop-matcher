@@ -1,7 +1,10 @@
+from io import BytesIO
 from pathlib import Path
+import warnings
 
 import cv2
 import numpy as np
+from PIL import Image, UnidentifiedImageError
 
 
 class ImageDecodeError(ValueError):
@@ -13,7 +16,25 @@ class ImageTooLargeError(ValueError):
 
 
 def decode_image_bytes(data: bytes, max_pixels: int) -> np.ndarray:
-    image = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(BytesIO(data)) as header:
+                width, height = header.size
+    except (Image.DecompressionBombError, Image.DecompressionBombWarning) as exc:
+        raise ImageTooLargeError("Decoded image exceeds the pixel limit") from exc
+    except (UnidentifiedImageError, OSError, SyntaxError, ValueError) as exc:
+        raise ImageDecodeError("The uploaded file is not a supported image") from exc
+
+    if width <= 0 or height <= 0:
+        raise ImageDecodeError("The uploaded file is not a supported image")
+    if width * height > max_pixels:
+        raise ImageTooLargeError("Decoded image exceeds the pixel limit")
+
+    try:
+        image = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
+    except cv2.error as exc:
+        raise ImageDecodeError("The uploaded file is not a supported image") from exc
     if image is None:
         raise ImageDecodeError("The uploaded file is not a supported image")
     if image.shape[0] * image.shape[1] > max_pixels:

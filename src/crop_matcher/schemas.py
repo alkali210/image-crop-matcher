@@ -1,6 +1,6 @@
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class StatusResponse(BaseModel):
@@ -21,7 +21,7 @@ class MatchItem(BaseModel):
     filename: str
     width: int
     height: int
-    similarity: float
+    similarity: float = Field(ge=0, le=100)
     image_url: str
 
 

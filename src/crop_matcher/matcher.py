@@ -48,6 +48,7 @@ class ImageMatcher:
         self.index = index
         self.settings = settings
         self._flann_lock = Lock()
+        self._sift_lock = Lock()
         self._sift = cv2.SIFT_create(
             nfeatures=settings.sift_features,
             contrastThreshold=settings.sift_contrast_threshold,
@@ -56,7 +57,8 @@ class ImageMatcher:
     def match(self, query_bgr: np.ndarray) -> MatchResult:
         query_gray = to_gray(query_bgr)
         feature_query, extraction_scale = self._feature_query(query_gray)
-        keypoints, descriptors = self._sift.detectAndCompute(feature_query, None)
+        with self._sift_lock:
+            keypoints, descriptors = self._sift.detectAndCompute(feature_query, None)
         points = np.asarray([point.pt for point in keypoints], dtype=np.float32).reshape(-1, 2)
         if descriptors is None or len(descriptors) < 4:
             return self._fallback(query_gray)

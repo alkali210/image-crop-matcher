@@ -108,7 +108,7 @@ def test_feature_index_includes_right_and_bottom_aligned_tiles(tmp_path: Path) -
     assert set(index.tiles.image_indices) == {0}
 
 
-def test_images_smaller_than_every_tile_size_are_safe(tmp_path: Path) -> None:
+def test_images_smaller_than_every_tile_size_get_persisted_fallback_tile(tmp_path: Path) -> None:
     gallery = tmp_path / "songs"
     write_blank_image(gallery / "small" / "base.png")
     settings = Settings(
@@ -121,9 +121,36 @@ def test_images_smaller_than_every_tile_size_are_safe(tmp_path: Path) -> None:
     built = FeatureIndex.load_or_build(catalog, settings)
     loaded = FeatureIndex.load_or_build(catalog, settings)
 
-    assert built.tiles.hashes.shape == (0,)
-    assert loaded.tiles.hashes.shape == (0,)
+    assert built.tiles.hashes.shape == (1,)
+    assert built.tiles.image_indices.tolist() == [0]
+    assert built.tiles.xs.tolist() == [0]
+    assert built.tiles.ys.tolist() == [0]
+    assert built.tiles.sizes.tolist() == [40]
+    assert np.array_equal(loaded.tiles.hashes, built.tiles.hashes)
+    assert np.array_equal(loaded.tiles.image_indices, built.tiles.image_indices)
+    assert np.array_equal(loaded.tiles.sizes, built.tiles.sizes)
     assert loaded.loaded_from_cache is True
+
+
+def test_cache_without_fallback_evidence_for_every_image_is_rebuilt(tmp_path: Path) -> None:
+    gallery = tmp_path / "songs"
+    write_textured_image(gallery / "one" / "base.jpg", 0)
+    write_textured_image(gallery / "two" / "base.jpg", 10)
+    settings = Settings(gallery_dir=gallery, cache_dir=tmp_path / "cache", tile_sizes=(64,))
+    catalog = ImageCatalog.scan(gallery, settings.max_image_pixels)
+    FeatureIndex.load_or_build(catalog, settings)
+    cache_path = settings.cache_dir / "features.npz"
+    with np.load(cache_path, allow_pickle=False) as cache:
+        arrays = {name: cache[name] for name in cache.files}
+    keep = arrays["tile_image_indices"] == 0
+    for name in ("tile_hashes", "tile_image_indices", "tile_xs", "tile_ys", "tile_sizes"):
+        arrays[name] = arrays[name][keep]
+    np.savez(cache_path, **arrays)
+
+    rebuilt = FeatureIndex.load_or_build(catalog, settings)
+
+    assert rebuilt.loaded_from_cache is False
+    assert set(rebuilt.tiles.image_indices.tolist()) == {0, 1}
 
 
 def test_single_pixel_tile_size_uses_a_safe_stride(tmp_path: Path) -> None:

@@ -153,6 +153,47 @@ function safeImageUrl(value) {
   return "";
 }
 
+function isValidMatchResponse(body) {
+  if (body === null || typeof body !== "object" || Array.isArray(body)) {
+    return false;
+  }
+  const query = body.query;
+  if (
+    query === null ||
+    typeof query !== "object" ||
+    !Number.isInteger(query.width) ||
+    query.width <= 0 ||
+    !Number.isInteger(query.height) ||
+    query.height <= 0 ||
+    !Number.isInteger(body.elapsed_ms) ||
+    body.elapsed_ms < 0 ||
+    !Array.isArray(body.matches) ||
+    body.matches.length === 0
+  ) {
+    return false;
+  }
+  return body.matches.every(
+    (match) =>
+      match !== null &&
+      typeof match === "object" &&
+      typeof match.image_id === "string" &&
+      match.image_id.length > 0 &&
+      typeof match.parent_name === "string" &&
+      typeof match.filename === "string" &&
+      match.filename.length > 0 &&
+      Number.isInteger(match.width) &&
+      match.width > 0 &&
+      Number.isInteger(match.height) &&
+      match.height > 0 &&
+      typeof match.similarity === "number" &&
+      Number.isFinite(match.similarity) &&
+      match.similarity >= 0 &&
+      match.similarity <= 100 &&
+      typeof match.image_url === "string" &&
+      safeImageUrl(match.image_url) !== "",
+  );
+}
+
 function textElement(tagName, className, text) {
   const element = document.createElement(tagName);
   element.className = className;
@@ -261,7 +302,7 @@ async function submitFile(file) {
       }
       throw new Error(MATCH_ERROR_MESSAGE);
     }
-    if (body === null) {
+    if (!isValidMatchResponse(body)) {
       throw new Error(MATCH_ERROR_MESSAGE);
     }
     renderQuery(file, body.query, body.elapsed_ms);

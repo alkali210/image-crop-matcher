@@ -1,6 +1,8 @@
+from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
-from threading import Lock
+from threading import Barrier, Lock
+import time
 from types import SimpleNamespace
 
 import cv2
@@ -147,14 +149,18 @@ def test_low_feature_crop_uses_fallback(tmp_path: Path) -> None:
 
 
 def test_fallback_skips_invalid_and_duplicate_tile_owners(
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    first_path = tmp_path / "first.png"
+    second_path = tmp_path / "second.png"
+    first_path.write_bytes(b"fixture")
+    second_path.write_bytes(b"fixture")
     records = (
-        ImageRecord("first", Path("first.png"), Path("first.png"), "", "first.png", 1, 1),
-        ImageRecord("second", Path("second.png"), Path("second.png"), "", "second.png", 1, 1),
+        ImageRecord("first", first_path, Path("first.png"), "", "first.png", 1, 1),
+        ImageRecord("second", second_path, Path("second.png"), "", "second.png", 1, 1),
     )
     matcher = ImageMatcher.__new__(ImageMatcher)
-    matcher.catalog = ImageCatalog(Path(), records, ())
+    matcher.catalog = ImageCatalog(tmp_path, records, ())
     matcher.index = SimpleNamespace(
         image_ids=("first", "second"),
         tiles=TileFeatures(
@@ -400,6 +406,7 @@ def test_match_ranks_by_raw_score_and_applies_bounded_margin(
             np.zeros((4, 128), np.float32),
         )
     )
+    matcher._sift_lock = Lock()
     monkeypatch.setattr(matcher, "_feature_query", lambda query: (query, 1.0))
     monkeypatch.setattr(matcher, "_retrieve", lambda _descriptors: ["second", "best"])
     monkeypatch.setattr(matcher, "_verify", lambda image_id, *_args: scores[image_id])
@@ -409,6 +416,42 @@ def test_match_ranks_by_raw_score_and_applies_bounded_margin(
     assert result.record == best_record
     assert result.similarity == pytest.approx(45.5)
     assert 0.0 <= result.similarity <= 100.0
+
+
+def test_simultaneous_matches_serialize_shared_sift(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class OverlapDetectingSift:
+        def __init__(self) -> None:
+            self.active = 0
+            self.maximum_active = 0
+            self.lock = Lock()
+
+        def detectAndCompute(self, *_args: object) -> tuple[list[object], None]:
+            with self.lock:
+                self.active += 1
+                self.maximum_active = max(self.maximum_active, self.active)
+            time.sleep(0.05)
+            with self.lock:
+                self.active -= 1
+            return [], None
+
+    matcher = ImageMatcher(ImageCatalog(Path(), (), ()), SimpleNamespace(), Settings())
+    sift = OverlapDetectingSift()
+    matcher._sift = sift
+    expected = object()
+    monkeypatch.setattr(matcher, "_fallback", lambda _query: expected)
+    barrier = Barrier(2)
+
+    def run_match() -> object:
+        barrier.wait()
+        return matcher.match(np.zeros((8, 8), np.uint8))
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _index: run_match(), range(2)))
+
+    assert results == [expected, expected]
+    assert sift.maximum_active == 1
 
 
 def test_fallback_empty_index_uses_private_error() -> None:

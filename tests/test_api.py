@@ -1,4 +1,7 @@
+from dataclasses import replace
+from io import BytesIO
 from pathlib import Path
+import subprocess
 import time
 from typing import Any
 
@@ -6,16 +9,25 @@ import cv2
 import numpy as np
 import pytest
 from fastapi.testclient import TestClient
+from PIL import Image
+from pydantic import ValidationError
 from starlette.datastructures import UploadFile
 
 from crop_matcher.config import Settings
 from crop_matcher.main import create_app
+from crop_matcher.schemas import MatchItem
 
 
 def encode(image: np.ndarray, extension: str = ".png") -> bytes:
     ok, payload = cv2.imencode(extension, image)
     assert ok
     return payload.tobytes()
+
+
+def compressed_png(width: int, height: int) -> bytes:
+    payload = BytesIO()
+    Image.new("1", (width, height)).save(payload, format="PNG")
+    return payload.getvalue()
 
 
 def make_client(tmp_path: Path, **setting_overrides: Any) -> TestClient:
@@ -40,6 +52,36 @@ def wait_until_ready(client: TestClient) -> dict[str, object]:
             return status
         time.sleep(0.01)
     pytest.fail("catalog did not finish building")
+
+
+def match_item(similarity: float) -> MatchItem:
+    return MatchItem(
+        image_id="id",
+        parent_name="parent",
+        filename="image.png",
+        width=10,
+        height=10,
+        similarity=similarity,
+        image_url="/api/images/id",
+    )
+
+
+@pytest.mark.parametrize("similarity", [-0.1, 100.1])
+def test_match_item_rejects_similarity_outside_percentage_range(similarity: float) -> None:
+    with pytest.raises(ValidationError):
+        match_item(similarity)
+
+
+def test_match_item_similarity_bounds_are_inclusive_and_in_openapi(tmp_path: Path) -> None:
+    assert match_item(0).similarity == 0
+    assert match_item(100).similarity == 100
+
+    schema = create_app(
+        Settings(gallery_dir=tmp_path / "songs", cache_dir=tmp_path / "cache")
+    ).openapi()["components"]["schemas"]["MatchItem"]["properties"]["similarity"]
+
+    assert schema["minimum"] == 0
+    assert schema["maximum"] == 100
 
 
 def test_status_match_and_safe_image_delivery(tmp_path: Path) -> None:
@@ -82,6 +124,22 @@ def test_status_match_and_safe_image_delivery(tmp_path: Path) -> None:
         assert client.get("/api/images/../../outside").status_code in {404, 422}
 
 
+def test_image_delivery_returns_404_for_catalog_path_outside_gallery(tmp_path: Path) -> None:
+    with make_client(tmp_path) as client:
+        assert wait_until_ready(client)["state"] == "ready"
+        catalog = client.app.state.services.snapshot().catalog
+        assert catalog is not None
+        record = catalog.records[0]
+        outside = tmp_path / "outside.jpg"
+        outside.write_bytes(record.path.read_bytes())
+        catalog._by_id[record.image_id] = replace(record, path=outside)
+
+        response = client.get(f"/api/images/{record.image_id}")
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "image_not_found"
+
+
 def test_rejects_invalid_oversized_and_excessive_pixel_uploads(tmp_path: Path) -> None:
     with make_client(tmp_path, max_upload_bytes=10_000, max_image_pixels=50_000) as client:
         assert wait_until_ready(client)["state"] == "ready"
@@ -119,6 +177,31 @@ def test_rejects_invalid_oversized_and_excessive_pixel_uploads(tmp_path: Path) -
             "code": "image_too_large",
             "message": "Decoded image exceeds the pixel limit",
         }
+
+
+def test_rejects_compressed_oversized_upload_before_opencv_decode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with make_client(tmp_path, max_image_pixels=25_000_000) as client:
+        assert wait_until_ready(client)["state"] == "ready"
+
+        def fail_decode(*_args: object) -> None:
+            pytest.fail("cv2.imdecode must not receive an oversized upload")
+
+        monkeypatch.setattr(cv2, "imdecode", fail_decode)
+        response = client.post(
+            "/api/match",
+            files={
+                "file": (
+                    "compressed.png",
+                    compressed_png(5_001, 5_000),
+                    "image/png",
+                )
+            },
+        )
+
+    assert response.status_code == 413
+    assert response.json()["error"]["code"] == "image_too_large"
 
 
 def test_upload_reads_only_limit_plus_one(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -185,6 +268,36 @@ def test_build_failure_and_unavailable_match_are_structured(tmp_path: Path) -> N
         "code": "service_unavailable",
         "message": "The image index is not ready",
     }
+
+
+def test_tiny_featureless_gallery_becomes_ready_and_matches(tmp_path: Path) -> None:
+    gallery = tmp_path / "songs"
+    source_path = gallery / "tiny" / "base.png"
+    source_path.parent.mkdir(parents=True)
+    source_path.write_bytes(encode(np.zeros((20, 30, 3), np.uint8)))
+    settings = Settings(
+        gallery_dir=gallery,
+        cache_dir=tmp_path / "cache",
+        tile_sizes=(64, 96),
+    )
+
+    with TestClient(create_app(settings)) as client:
+        status = wait_until_ready(client)
+        response = client.post(
+            "/api/match",
+            files={
+                "file": (
+                    "query.png",
+                    encode(np.zeros((10, 10, 3), np.uint8)),
+                    "image/png",
+                )
+            },
+        )
+
+    assert status["state"] == "ready"
+    assert status["indexed_images"] == 1
+    assert response.status_code == 200
+    assert response.json()["matches"][0]["parent_name"] == "tiny"
 
 
 def test_internal_match_error_is_generic_and_does_not_leak_paths(
@@ -262,3 +375,97 @@ def test_frontend_script_contains_retry_lifecycle_and_error_contracts(tmp_path: 
     assert 'window.addEventListener("pagehide", (event) =>' in script.text
     assert "if (event.persisted)" in script.text
     assert 'window.addEventListener("pageshow", restorePage);' in script.text
+
+
+def test_frontend_rejects_malformed_success_before_allocating_query_url() -> None:
+    app_script = Path(__file__).parents[1] / "src" / "crop_matcher" / "static" / "app.js"
+    harness = r"""
+const fs = require("fs");
+const vm = require("vm");
+
+class Element {
+  constructor() {
+    this.attrs = new Map();
+    this.dataset = {};
+    this.disabled = false;
+    this.files = [];
+    this.hidden = true;
+    this.listeners = {};
+    this.textContent = "";
+    this.value = "";
+  }
+  addEventListener(name, callback) { this.listeners[name] = callback; }
+  append() {}
+  click() {}
+  contains() { return false; }
+  focus() {}
+  getAttribute(name) { return this.attrs.has(name) ? this.attrs.get(name) : null; }
+  removeAttribute(name) { this.attrs.delete(name); }
+  replaceChildren() {}
+  setAttribute(name, value) { this.attrs.set(name, String(value)); }
+}
+
+const selectors = [
+  "#drop-zone", "#file-input", "#index-status", "#status-text", "#loading-status",
+  "#error-message", "#upload-view", "#results-view", "#results-heading", "#query-summary",
+  "#query-preview", "#query-name", "#query-meta", "#result-list", "#reupload-button",
+];
+const elements = new Map(selectors.map((selector) => [selector, new Element()]));
+elements.get("#drop-zone").setAttribute("aria-disabled", "false");
+elements.get("#index-status").dataset.state = "ready";
+elements.get("#loading-status").hidden = true;
+const file = { name: "query.png", size: 100 };
+elements.get("#file-input").files = [file];
+
+let createdUrls = 0;
+let revokedUrls = 0;
+const windowObject = {
+  addEventListener() {},
+  clearTimeout() {},
+  location: { origin: "http://testserver" },
+  setTimeout() { return 1; },
+};
+const context = {
+  console,
+  document: {
+    createElement() { return new Element(); },
+    createTextNode(text) { return { textContent: text }; },
+    querySelector(selector) { return elements.get(selector); },
+  },
+  fetch: async () => ({
+    ok: true,
+    json: async () => ({ query: {}, elapsed_ms: 4, matches: [] }),
+  }),
+  FormData: class { append() {} },
+  URL: {
+    createObjectURL() { createdUrls += 1; return "blob:test"; },
+    revokeObjectURL() { revokedUrls += 1; },
+  },
+  window: windowObject,
+};
+vm.createContext(context);
+vm.runInContext(fs.readFileSync(process.argv[1], "utf8"), context);
+
+(async () => {
+  elements.get("#file-input").listeners.change();
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  const error = elements.get("#error-message");
+  if (error.hidden || error.textContent !== "匹配失败，请重试") {
+    throw new Error(`generic error was not shown: ${error.textContent}`);
+  }
+  if (createdUrls !== 0 || revokedUrls !== 0) {
+    throw new Error(`unexpected URL lifecycle: created=${createdUrls} revoked=${revokedUrls}`);
+  }
+})().catch((error) => {
+  console.error(error.stack || error);
+  process.exitCode = 1;
+});
+"""
+
+    subprocess.run(
+        ["node", "-e", harness, str(app_script)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )

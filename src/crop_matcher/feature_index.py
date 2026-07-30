@@ -11,7 +11,7 @@ from crop_matcher.catalog import ImageCatalog
 from crop_matcher.config import Settings
 from crop_matcher.imaging import perceptual_hash, read_image, resize_to_max, to_gray
 
-CACHE_SCHEMA_VERSION = 2
+CACHE_SCHEMA_VERSION = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,8 +112,9 @@ class FeatureIndex:
         tile_sizes: list[int] = []
 
         for image_index, record in enumerate(catalog.records):
+            safe_record = catalog.get(record.image_id)
             image, scale = resize_to_max(
-                read_image(record.path, settings.max_image_pixels),
+                read_image(safe_record.path, settings.max_image_pixels),
                 settings.working_max_edge,
             )
             gray = to_gray(image)
@@ -142,6 +143,7 @@ class FeatureIndex:
             descriptor_image_groups.append(np.full(len(descriptors), image_index, dtype=np.int32))
 
             height, width = gray.shape[:2]
+            first_tile_index = len(tile_hashes)
             for size in settings.tile_sizes:
                 if size <= 0 or size > width or size > height:
                     continue
@@ -159,6 +161,13 @@ class FeatureIndex:
                         tile_xs.append(x)
                         tile_ys.append(y)
                         tile_sizes.append(size)
+            if len(tile_hashes) == first_tile_index:
+                size = min(width, height)
+                tile_hashes.append(perceptual_hash(gray[:size, :size]))
+                tile_image_indices.append(image_index)
+                tile_xs.append(0)
+                tile_ys.append(0)
+                tile_sizes.append(size)
 
         all_descriptors = cls._concatenate_rows(descriptor_groups, 128, np.float32)
         if descriptor_image_groups:
@@ -411,6 +420,8 @@ class FeatureIndex:
         tile_owners = arrays["tile_image_indices"]
         if len(tile_owners) and (tile_owners.min() < 0 or tile_owners.max() >= image_count):
             raise ValueError("Cached tile owner is out of range")
+        if not np.array_equal(np.unique(tile_owners), np.arange(image_count, dtype=np.int32)):
+            raise ValueError("Cached tiles do not cover every image")
         tile_xs = arrays["tile_xs"].astype(np.int64)
         tile_ys = arrays["tile_ys"].astype(np.int64)
         tile_sizes = arrays["tile_sizes"].astype(np.int64)
