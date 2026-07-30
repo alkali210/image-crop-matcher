@@ -222,3 +222,17 @@ def test_missing_upload_and_static_hooks_do_not_require_static_files(tmp_path: P
         response = client.post("/api/match")
     assert response.status_code == 422
     assert response.json()["error"]["code"] == "invalid_request"
+
+
+def test_root_serves_functional_static_shell(tmp_path: Path) -> None:
+    with make_client(tmp_path) as client:
+        response = client.get("/")
+        assert response.status_code == 200
+        assert 'id="drop-zone"' in response.text
+        assert 'id="result-list"' in response.text
+        assert '<label class="visually-hidden" for="file-input">' in response.text
+        assert 'class="brand" href="/" aria-label=' not in response.text
+        assert "Find the frame" not in response.text
+        assert "几何内点稳定" not in response.text
+        assert client.get("/static/styles.css").status_code == 200
+        assert client.get("/static/app.js").status_code == 200
