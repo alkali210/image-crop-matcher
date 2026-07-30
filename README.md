@@ -38,10 +38,15 @@ Place source images anywhere below `songs/`. The recursive scan supports `.jpg`,
 `.webp`, and `.bmp` files, case-insensitively. Files whose stem ends in `_256` are treated as
 generated thumbnails and excluded.
 
-The first startup scans the gallery and builds SIFT and perceptual-hash data in `.cache/`, so it
-takes longer. Later startups validate the gallery manifest and load cached NumPy arrays with
-pickling disabled; the in-memory FLANN search tree is still rebuilt. `GET /api/status` reports
-`building`, `ready`, or `error` and includes the indexed image count and build time.
+The first startup scans and decodes the gallery, then stores catalog metadata in
+`.cache/catalog.json` and SIFT/perceptual-hash arrays in `.cache/features.npz`. Later startups only
+compare file paths, sizes, and modification times before restoring the cached dimensions and feature
+arrays; source image contents are not read again while the gallery is unchanged. The in-memory FLANN
+search tree is still rebuilt from the cached descriptors. `GET /api/status` reports `building`,
+`ready`, or `error` and includes the indexed image count and build time.
+
+After upgrading from an older cache schema, the next startup performs one full rebuild. Subsequent
+starts use the new catalog and feature caches normally.
 
 The application does not watch the gallery. Restart Uvicorn after adding, replacing, moving, or
 removing an image. A gallery manifest change invalidates the complete feature cache, which is then

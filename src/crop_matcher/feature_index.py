@@ -11,7 +11,7 @@ from crop_matcher.catalog import ImageCatalog
 from crop_matcher.config import Settings
 from crop_matcher.imaging import perceptual_hash, read_image, resize_to_max, to_gray
 
-CACHE_SCHEMA_VERSION = 3
+CACHE_SCHEMA_VERSION = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +66,7 @@ class FeatureIndex:
         expected_image_ids = tuple(record.image_id for record in catalog.records)
         identity_source = {
             "schema_version": CACHE_SCHEMA_VERSION,
+            "gallery_root": catalog.root.as_posix(),
             "feature_settings": {
                 "working_max_edge": settings.working_max_edge,
                 "sift_features": settings.sift_features,

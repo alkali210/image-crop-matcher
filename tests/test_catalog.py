@@ -1,10 +1,13 @@
+import json
 import logging
+import os
 from pathlib import Path
 
 import cv2
 import numpy as np
 import pytest
 
+import crop_matcher.catalog as catalog_module
 from crop_matcher.catalog import ImageCatalog
 
 
@@ -138,6 +141,240 @@ def test_ids_are_stable_and_unknown_ids_do_not_resolve(tmp_path: Path) -> None:
     assert first.records[0].image_id == second.records[0].image_id
     with pytest.raises(KeyError):
         first.get("../../outside")
+
+
+def test_load_or_scan_restores_unchanged_catalog_without_decoding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gallery = tmp_path / "gallery"
+    cache_path = tmp_path / "cache" / "catalog.json"
+    write_image(gallery / "song" / "base.png", 60)
+
+    first = ImageCatalog.load_or_scan(gallery, max_pixels=10_000, cache_path=cache_path)
+
+    def fail_decode(_path: Path, _max_pixels: int) -> np.ndarray:
+        raise AssertionError("warm catalog load must not decode source images")
+
+    monkeypatch.setattr(catalog_module, "read_image", fail_decode)
+    second = ImageCatalog.load_or_scan(gallery, max_pixels=10_000, cache_path=cache_path)
+
+    assert second.records == first.records
+    assert second.manifest == first.manifest
+
+
+def test_load_or_scan_rebuilds_catalog_when_source_metadata_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gallery = tmp_path / "gallery"
+    source = gallery / "song" / "base.png"
+    cache_path = tmp_path / "cache" / "catalog.json"
+    write_image(source, 60)
+    ImageCatalog.load_or_scan(gallery, max_pixels=10_000, cache_path=cache_path)
+    ok, payload = cv2.imencode(".png", np.full((12, 30, 3), 90, np.uint8))
+    assert ok
+    source.write_bytes(payload.tobytes())
+    decode_count = 0
+    original_read_image = catalog_module.read_image
+
+    def count_decode(path: Path, max_pixels: int) -> np.ndarray:
+        nonlocal decode_count
+        decode_count += 1
+        return original_read_image(path, max_pixels)
+
+    monkeypatch.setattr(catalog_module, "read_image", count_decode)
+    rebuilt = ImageCatalog.load_or_scan(gallery, max_pixels=10_000, cache_path=cache_path)
+
+    assert decode_count == 1
+    assert (rebuilt.records[0].width, rebuilt.records[0].height) == (30, 12)
+
+
+def test_load_or_scan_rebuilds_malformed_catalog_cache(tmp_path: Path) -> None:
+    gallery = tmp_path / "gallery"
+    cache_path = tmp_path / "cache" / "catalog.json"
+    write_image(gallery / "song" / "base.png", 60)
+    cache_path.parent.mkdir(parents=True)
+    cache_path.write_text("not-json", encoding="utf-8")
+
+    catalog = ImageCatalog.load_or_scan(gallery, max_pixels=10_000, cache_path=cache_path)
+
+    assert len(catalog.records) == 1
+    assert (
+        json.loads(cache_path.read_text("utf-8"))["schema_version"]
+        == catalog_module.CATALOG_CACHE_SCHEMA_VERSION
+    )
+
+
+def test_load_or_scan_does_not_reuse_cache_for_another_gallery(tmp_path: Path) -> None:
+    first_gallery = tmp_path / "first"
+    second_gallery = tmp_path / "second"
+    first_source = first_gallery / "song" / "base.bmp"
+    second_source = second_gallery / "song" / "base.bmp"
+    first_source.parent.mkdir(parents=True)
+    second_source.parent.mkdir(parents=True)
+    ok, first_payload = cv2.imencode(".bmp", np.full((20, 20, 3), 40, np.uint8))
+    assert ok
+    ok, second_payload = cv2.imencode(".bmp", np.full((10, 40, 3), 80, np.uint8))
+    assert ok
+    payload_size = max(len(first_payload), len(second_payload))
+    first_source.write_bytes(first_payload.tobytes().ljust(payload_size, b"\0"))
+    second_source.write_bytes(second_payload.tobytes().ljust(payload_size, b"\0"))
+    fixed_mtime = 1_700_000_000_000_000_000
+    os.utime(first_source, ns=(fixed_mtime, fixed_mtime))
+    os.utime(second_source, ns=(fixed_mtime, fixed_mtime))
+    cache_path = tmp_path / "cache" / "catalog.json"
+
+    ImageCatalog.load_or_scan(first_gallery, max_pixels=10_000, cache_path=cache_path)
+    second = ImageCatalog.load_or_scan(second_gallery, max_pixels=10_000, cache_path=cache_path)
+
+    assert (second.records[0].width, second.records[0].height) == (40, 10)
+
+
+def test_load_or_scan_rejects_tampered_cached_record(tmp_path: Path) -> None:
+    gallery = tmp_path / "gallery"
+    cache_path = tmp_path / "cache" / "catalog.json"
+    write_image(gallery / "song" / "base.png", 60)
+    ImageCatalog.load_or_scan(gallery, max_pixels=10_000, cache_path=cache_path)
+    payload = json.loads(cache_path.read_text("utf-8"))
+    payload["records"][0]["relative_path"] = "song/base_256.png"
+    cache_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    rebuilt = ImageCatalog.load_or_scan(gallery, max_pixels=10_000, cache_path=cache_path)
+
+    assert rebuilt.records[0].relative_path.as_posix() == "song/base.png"
+
+
+def test_load_or_scan_rebuilds_non_finite_numeric_cache_value(tmp_path: Path) -> None:
+    gallery = tmp_path / "gallery"
+    cache_path = tmp_path / "cache" / "catalog.json"
+    write_image(gallery / "song" / "base.png", 60)
+    ImageCatalog.load_or_scan(gallery, max_pixels=10_000, cache_path=cache_path)
+    payload = cache_path.read_text("utf-8").replace('"width":20', '"width":Infinity')
+    cache_path.write_text(payload, encoding="utf-8")
+
+    rebuilt = ImageCatalog.load_or_scan(gallery, max_pixels=10_000, cache_path=cache_path)
+
+    assert rebuilt.records[0].width == 20
+
+
+def test_load_or_scan_retries_when_source_changes_during_decode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gallery = tmp_path / "gallery"
+    source = gallery / "song" / "base.png"
+    cache_path = tmp_path / "cache" / "catalog.json"
+    write_image(source, 60)
+    original_read_image = catalog_module.read_image
+    changed = False
+
+    def change_then_decode(path: Path, max_pixels: int) -> np.ndarray:
+        nonlocal changed
+        if not changed:
+            changed = True
+            ok, payload = cv2.imencode(".png", np.full((12, 30, 3), 90, np.uint8))
+            assert ok
+            source.write_bytes(payload.tobytes())
+        return original_read_image(path, max_pixels)
+
+    monkeypatch.setattr(catalog_module, "read_image", change_then_decode)
+    first = ImageCatalog.load_or_scan(gallery, max_pixels=10_000, cache_path=cache_path)
+    assert (first.records[0].width, first.records[0].height) == (30, 12)
+
+    def fail_decode(_path: Path, _max_pixels: int) -> np.ndarray:
+        raise AssertionError("consistent retry should publish the changed source metadata")
+
+    monkeypatch.setattr(catalog_module, "read_image", fail_decode)
+    second = ImageCatalog.load_or_scan(gallery, max_pixels=10_000, cache_path=cache_path)
+    assert second.records == first.records
+
+
+def test_external_symlink_candidate_participates_in_cache_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gallery = tmp_path / "gallery"
+    source = gallery / "song" / "base.png"
+    cache_path = tmp_path / "cache" / "catalog.json"
+    write_image(source, 60)
+    ImageCatalog.load_or_scan(gallery, max_pixels=10_000, cache_path=cache_path)
+    outside = tmp_path / "outside.png"
+    write_image(outside, 70)
+    create_symlink_or_skip(gallery / "external.png", outside)
+    decode_count = 0
+    original_read_image = catalog_module.read_image
+
+    def count_decode(path: Path, max_pixels: int) -> np.ndarray:
+        nonlocal decode_count
+        decode_count += 1
+        return original_read_image(path, max_pixels)
+
+    monkeypatch.setattr(catalog_module, "read_image", count_decode)
+    ImageCatalog.load_or_scan(gallery, max_pixels=10_000, cache_path=cache_path)
+
+    assert decode_count == 1
+
+
+def test_external_symlink_target_metadata_participates_in_cache_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gallery = tmp_path / "gallery"
+    source = gallery / "song" / "base.png"
+    cache_path = tmp_path / "cache" / "catalog.json"
+    write_image(source, 60)
+    outside = tmp_path / "outside.png"
+    write_image(outside, 70)
+    create_symlink_or_skip(gallery / "external.png", outside)
+    ImageCatalog.load_or_scan(gallery, max_pixels=10_000, cache_path=cache_path)
+    write_image(outside, 90)
+    decode_count = 0
+    original_read_image = catalog_module.read_image
+
+    def count_decode(path: Path, max_pixels: int) -> np.ndarray:
+        nonlocal decode_count
+        decode_count += 1
+        return original_read_image(path, max_pixels)
+
+    monkeypatch.setattr(catalog_module, "read_image", count_decode)
+    ImageCatalog.load_or_scan(gallery, max_pixels=10_000, cache_path=cache_path)
+
+    assert decode_count == 1
+
+
+def test_load_or_scan_rebuilds_when_json_parser_recurses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gallery = tmp_path / "gallery"
+    cache_path = tmp_path / "cache" / "catalog.json"
+    write_image(gallery / "song" / "base.png", 60)
+    ImageCatalog.load_or_scan(gallery, max_pixels=10_000, cache_path=cache_path)
+    original_loads = catalog_module.json.loads
+    calls = 0
+
+    def recurse_once(*args: object, **kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RecursionError("nested cache")
+        return original_loads(*args, **kwargs)
+
+    monkeypatch.setattr(catalog_module.json, "loads", recurse_once)
+    rebuilt = ImageCatalog.load_or_scan(gallery, max_pixels=10_000, cache_path=cache_path)
+
+    assert rebuilt.records[0].width == 20
+
+
+def test_load_or_scan_rejects_non_integer_cached_dimensions(tmp_path: Path) -> None:
+    gallery = tmp_path / "gallery"
+    cache_path = tmp_path / "cache" / "catalog.json"
+    write_image(gallery / "song" / "base.png", 60)
+    ImageCatalog.load_or_scan(gallery, max_pixels=10_000, cache_path=cache_path)
+    payload = json.loads(cache_path.read_text("utf-8"))
+    payload["records"][0]["width"] = True
+    body = {key: value for key, value in payload.items() if key != "cache_identity"}
+    payload["cache_identity"] = ImageCatalog._cache_identity(body)
+    cache_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    rebuilt = ImageCatalog.load_or_scan(gallery, max_pixels=10_000, cache_path=cache_path)
+
+    assert rebuilt.records[0].width == 20
 
 
 def test_get_rejects_record_whose_resolved_path_is_outside_root(tmp_path: Path) -> None:

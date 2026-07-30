@@ -104,9 +104,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def build_services() -> None:
         started = time.perf_counter()
         try:
-            catalog = ImageCatalog.scan(
+            catalog = ImageCatalog.load_or_scan(
                 resolved_settings.gallery_dir,
                 resolved_settings.max_image_pixels,
+                resolved_settings.cache_dir / "catalog.json",
             )
             if not catalog.records:
                 services.set_error(
