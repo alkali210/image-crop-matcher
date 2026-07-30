@@ -232,6 +232,7 @@ def test_root_serves_functional_static_shell(tmp_path: Path) -> None:
         assert 'id="result-list"' in response.text
         assert '<label class="visually-hidden" for="file-input">' in response.text
         assert 'class="brand" href="/" aria-label=' not in response.text
+        assert '<link rel="icon" href="data:,">' in response.text
         assert "Find the frame" not in response.text
         assert "几何内点稳定" not in response.text
         assert client.get("/static/styles.css").status_code == 200

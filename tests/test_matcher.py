@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from threading import Lock
 from types import SimpleNamespace
@@ -431,3 +432,79 @@ def test_fallback_empty_index_uses_private_error() -> None:
 
     with pytest.raises(error_type, match="Fallback index is empty"):
         matcher._fallback(np.zeros((8, 8), np.uint8))
+
+
+def test_benchmark_queries_are_deterministic() -> None:
+    from benchmarks.benchmark import crop_specs
+
+    first = list(crop_specs(seed=20260730, image_count=3, samples_per_image=2))
+    second = list(crop_specs(seed=20260730, image_count=3, samples_per_image=2))
+    assert first == second
+    assert {spec.output_size for spec in first}.issubset({64, 90, 128, 192})
+    assert all(0.10 <= spec.crop_fraction <= 0.40 for spec in first)
+
+
+def test_benchmark_accuracy_exit_status_uses_95_percent_boundary() -> None:
+    from benchmarks.benchmark import accuracy_exit_status
+
+    assert accuracy_exit_status(1.0) == 0
+    assert accuracy_exit_status(0.95) == 0
+    assert accuracy_exit_status(0.9499) == 1
+
+
+def test_benchmark_failure_json_has_exact_metadata(tmp_path: Path) -> None:
+    from benchmarks.benchmark import CropSpec, write_failure
+
+    spec = CropSpec(1, 2, 0.25, 0.5, 0.75, 90, True)
+    path = write_failure(
+        tmp_path,
+        7,
+        source_id="source",
+        predicted_id="predicted",
+        x=11,
+        y=13,
+        side=101,
+        spec=spec,
+        similarity=72.5,
+        latency_ms=4.5678,
+    )
+
+    assert path.name == "failure-000007.json"
+    assert json.loads(path.read_text("utf-8")) == {
+        "source_id": "source",
+        "predicted_id": "predicted",
+        "crop_x": 11,
+        "crop_y": 13,
+        "crop_side": 101,
+        "output_size": 90,
+        "grayscale": True,
+        "similarity": 72.5,
+        "latency_ms": 4.568,
+    }
+
+
+def test_benchmark_cli_returns_zero_at_accuracy_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from benchmarks.benchmark import main
+
+    gallery = tmp_path / "songs"
+    write_png(gallery / "only" / "base.png", make_art(7))
+    monkeypatch.chdir(tmp_path)
+
+    exit_status = main(
+        [
+            "--gallery",
+            str(gallery),
+            "--samples-per-image",
+            "1",
+        ]
+    )
+
+    output = capsys.readouterr().out.splitlines()
+    assert exit_status == 0
+    assert output[:2] == ["images=1 queries=1", "top1=1/1 accuracy=100.00%"]
+    assert output[2] in {"method_sift=1 method_phash=0", "method_sift=0 method_phash=1"}
+    assert output[3].startswith("latency_ms_p50=")
+    assert " latency_ms_p95=" in output[3]
+    assert (tmp_path / "benchmark-failures").is_dir()

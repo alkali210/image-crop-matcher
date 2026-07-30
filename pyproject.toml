@@ -27,6 +27,7 @@ dev = [
 packages = ["src/crop_matcher"]
 
 [tool.pytest.ini_options]
+pythonpath = ["."]
 testpaths = ["tests"]
 
 [tool.ruff]
