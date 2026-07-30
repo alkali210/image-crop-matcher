@@ -1,6 +1,15 @@
 "use strict";
 
-const state = { selectedFile: null, queryUrl: null, statusTimer: null };
+const STATUS_POLL_DELAY_MS = 750;
+const STATUS_RETRY_MESSAGE = "暂时无法读取索引，正在重试...";
+const MATCH_ERROR_MESSAGE = "匹配失败，请重试";
+
+const state = {
+  selectedFile: null,
+  queryUrl: null,
+  statusTimer: null,
+  statusPending: false,
+};
 
 const dropZone = document.querySelector("#drop-zone");
 const fileInput = document.querySelector("#file-input");
@@ -44,9 +53,34 @@ function renderStatus(status) {
   statusText.textContent = `图片索引不可用${detail}`;
 }
 
+function clearStatusTimer() {
+  if (state.statusTimer !== null) {
+    window.clearTimeout(state.statusTimer);
+    state.statusTimer = null;
+  }
+}
+
+function scheduleStatusPoll() {
+  clearStatusTimer();
+  state.statusTimer = window.setTimeout(() => {
+    state.statusTimer = null;
+    pollStatus();
+  }, STATUS_POLL_DELAY_MS);
+}
+
+function renderStatusUnavailable() {
+  indexStatus.dataset.state = "error";
+  statusText.textContent = STATUS_RETRY_MESSAGE;
+  setUploadEnabled(false);
+}
+
 async function pollStatus() {
-  window.clearTimeout(state.statusTimer);
-  state.statusTimer = null;
+  if (state.statusPending) {
+    return;
+  }
+
+  clearStatusTimer();
+  state.statusPending = true;
 
   try {
     const response = await fetch("/api/status");
@@ -56,14 +90,13 @@ async function pollStatus() {
     const status = await response.json();
     renderStatus(status);
     if (status.state === "building") {
-      state.statusTimer = window.setTimeout(pollStatus, 750);
+      scheduleStatusPoll();
     }
-  } catch (error) {
-    renderStatus({
-      state: "error",
-      indexed_images: 0,
-      error: error instanceof Error ? error.message : "无法读取索引状态",
-    });
+  } catch (_error) {
+    renderStatusUnavailable();
+    scheduleStatusPoll();
+  } finally {
+    state.statusPending = false;
   }
 }
 
@@ -198,6 +231,14 @@ function showResults() {
   resultsHeading.focus();
 }
 
+async function parseJsonResponse(response) {
+  try {
+    return await response.json();
+  } catch (_error) {
+    return null;
+  }
+}
+
 async function submitFile(file) {
   if (!file || dropZone.getAttribute("aria-disabled") === "true") {
     return;
@@ -208,18 +249,26 @@ async function submitFile(file) {
   clearError();
   const form = new FormData();
   form.append("file", file);
+  let failureMessage = MATCH_ERROR_MESSAGE;
 
   try {
     const response = await fetch("/api/match", { method: "POST", body: form });
-    const body = await response.json();
+    const body = await parseJsonResponse(response);
     if (!response.ok) {
-      throw new Error(body.error?.message || "匹配失败，请重试");
+      const apiMessage = body?.error?.message;
+      if (typeof apiMessage === "string" && apiMessage.trim()) {
+        failureMessage = apiMessage;
+      }
+      throw new Error(MATCH_ERROR_MESSAGE);
+    }
+    if (body === null) {
+      throw new Error(MATCH_ERROR_MESSAGE);
     }
     renderQuery(file, body.query, body.elapsed_ms);
     renderMatches(body.matches);
     showResults();
-  } catch (error) {
-    showError(error instanceof Error ? error.message : "匹配失败，请重试");
+  } catch (_error) {
+    showError(failureMessage);
   } finally {
     setBusy(false);
     fileInput.value = "";
@@ -245,6 +294,18 @@ function resetUpload() {
   clearError();
   fileInput.value = "";
   dropZone.focus();
+}
+
+function restorePage() {
+  if (state.queryUrl !== null && !resultsView.hidden) {
+    queryPreview.src = state.queryUrl;
+  }
+
+  const isReady = indexStatus.dataset.state === "ready";
+  setUploadEnabled(isReady);
+  if (!isReady && state.statusTimer === null && !state.statusPending) {
+    pollStatus();
+  }
 }
 
 dropZone.addEventListener("click", openFilePicker);
@@ -283,9 +344,11 @@ fileInput.addEventListener("change", () => {
 });
 
 reuploadButton.addEventListener("click", resetUpload);
-window.addEventListener("pagehide", () => {
-  window.clearTimeout(state.statusTimer);
+window.addEventListener("pagehide", (event) => {
+  if (event.persisted) {
+    return;
+  }
+  clearStatusTimer();
   revokeQueryUrl();
 });
-
-pollStatus();
+window.addEventListener("pageshow", restorePage);

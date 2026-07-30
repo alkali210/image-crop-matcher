@@ -236,3 +236,28 @@ def test_root_serves_functional_static_shell(tmp_path: Path) -> None:
         assert "几何内点稳定" not in response.text
         assert client.get("/static/styles.css").status_code == 200
         assert client.get("/static/app.js").status_code == 200
+
+
+def test_upload_shell_lists_exact_supported_formats_and_limits(tmp_path: Path) -> None:
+    with make_client(tmp_path) as client:
+        response = client.get("/")
+
+    assert response.status_code == 200
+    assert 'accept=".jpg,.jpeg,.png,.webp,.bmp"' in response.text
+    assert "JPG、JPEG、PNG、WebP、BMP" in response.text
+    assert "10 MiB" in response.text
+    assert "25 MP" in response.text
+
+
+def test_frontend_script_contains_retry_lifecycle_and_error_contracts(tmp_path: Path) -> None:
+    with make_client(tmp_path) as client:
+        script = client.get("/static/app.js")
+
+    assert script.status_code == 200
+    assert 'const STATUS_RETRY_MESSAGE = "暂时无法读取索引，正在重试...";' in script.text
+    assert "function scheduleStatusPoll()" in script.text
+    assert "function parseJsonResponse(response)" in script.text
+    assert 'const MATCH_ERROR_MESSAGE = "匹配失败，请重试";' in script.text
+    assert 'window.addEventListener("pagehide", (event) =>' in script.text
+    assert "if (event.persisted)" in script.text
+    assert 'window.addEventListener("pageshow", restorePage);' in script.text
