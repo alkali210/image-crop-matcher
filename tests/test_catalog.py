@@ -1,3 +1,4 @@
+import logging
 from pathlib import Path
 
 import cv2
@@ -58,6 +59,60 @@ def test_scan_skips_opencv_decode_failure_and_keeps_valid_peers(
     catalog = ImageCatalog.scan(tmp_path, max_pixels=10_000)
 
     assert [record.relative_path.as_posix() for record in catalog.records] == ["b-valid.png"]
+
+
+@pytest.mark.parametrize(
+    ("failure", "reason"),
+    [
+        ("corrupt", "not a supported image"),
+        ("oversized", "exceeds the pixel limit"),
+        ("outside", "outside.png"),
+        ("filesystem", "stat failed"),
+    ],
+)
+def test_scan_warns_for_skipped_source_and_keeps_valid_peers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    failure: str,
+    reason: str,
+) -> None:
+    gallery = tmp_path / "gallery"
+    bad = gallery / f"bad-{failure}.png"
+    valid = gallery / "valid.png"
+    write_image(valid, 30)
+    max_pixels = 10_000
+
+    if failure == "corrupt":
+        bad.write_bytes(b"broken")
+    elif failure == "oversized":
+        write_image(bad, 20)
+        ok, payload = cv2.imencode(".png", np.full((5, 5, 3), 30, np.uint8))
+        assert ok
+        valid.write_bytes(payload.tobytes())
+        max_pixels = 100
+    elif failure == "outside":
+        outside = tmp_path / "outside.png"
+        write_image(outside, 20)
+        create_symlink_or_skip(bad, outside)
+    else:
+        write_image(bad, 20)
+        original_stat = Path.stat
+
+        def selective_stat(path: Path, *args: object, **kwargs: object) -> object:
+            if path.name == bad.name:
+                raise OSError("stat failed")
+            return original_stat(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "stat", selective_stat)
+
+    with caplog.at_level(logging.WARNING, logger="crop_matcher.catalog"):
+        catalog = ImageCatalog.scan(gallery, max_pixels=max_pixels)
+
+    assert [record.relative_path.as_posix() for record in catalog.records] == ["valid.png"]
+    warning = next(record for record in caplog.records if bad.name in record.getMessage())
+    assert warning.levelno == logging.WARNING
+    assert reason in warning.getMessage()
 
 
 def test_scan_breaks_casefold_sort_ties_with_original_path(

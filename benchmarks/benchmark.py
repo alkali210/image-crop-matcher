@@ -235,7 +235,8 @@ def run_benchmark(
     matcher = ImageMatcher(catalog, index, settings)
     specs = list(crop_specs(seed, len(catalog.records), samples_per_image))
 
-    warmup, *_ = _query_for(catalog.records[0], specs[0], settings.max_image_pixels)
+    warmup_record = catalog.get(catalog.records[0].image_id)
+    warmup, *_ = _query_for(warmup_record, specs[0], settings.max_image_pixels)
     matcher.match(warmup)
 
     correct = 0
@@ -243,6 +244,7 @@ def run_benchmark(
     latencies_ms: list[float] = []
     for query_number, spec in enumerate(specs, start=1):
         record = catalog.records[spec.image_index]
+        record = catalog.get(record.image_id)
         query, x, y, side = _query_for(record, spec, settings.max_image_pixels)
         started = time.perf_counter_ns()
         result = matcher.match(query)

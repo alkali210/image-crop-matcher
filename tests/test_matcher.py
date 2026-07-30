@@ -650,6 +650,45 @@ def test_benchmark_seeds_opencv_before_catalog_scan(
         )
 
 
+def test_benchmark_rejects_source_replaced_by_external_symlink_after_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from benchmarks import benchmark
+
+    gallery = tmp_path / "songs"
+    source = gallery / "song" / "base.png"
+    outside = tmp_path / "outside.png"
+    write_png(source, make_art(1))
+    write_png(outside, make_art(2))
+
+    def replace_after_scan(catalog: ImageCatalog, _settings: Settings) -> object:
+        source.unlink()
+        try:
+            source.symlink_to(outside)
+        except OSError as exc:
+            pytest.skip(f"file symlinks are unavailable: {exc}")
+        return object()
+
+    class MatcherMustNotReadExternalContent:
+        def __init__(self, *_args: object) -> None:
+            pass
+
+        def match(self, _query: np.ndarray) -> None:
+            pytest.fail("benchmark read external content after the source was replaced")
+
+    monkeypatch.setattr(benchmark.FeatureIndex, "load_or_build", replace_after_scan)
+    monkeypatch.setattr(benchmark, "ImageMatcher", MatcherMustNotReadExternalContent)
+
+    with pytest.raises(KeyError):
+        benchmark.run_benchmark(
+            gallery=gallery,
+            samples_per_image=1,
+            max_images=None,
+            seed=20260730,
+            failure_dir=tmp_path / "failures",
+        )
+
+
 def test_benchmark_owned_failure_lifecycle_and_status_one(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

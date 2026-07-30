@@ -1,10 +1,13 @@
 from dataclasses import dataclass, replace
 from hashlib import blake2s
+import logging
 from pathlib import Path
+import stat
 
 from crop_matcher.imaging import ImageDecodeError, ImageTooLargeError, read_image
 
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,8 +49,7 @@ class ImageCatalog:
             (
                 path
                 for path in root.rglob("*")
-                if path.is_file()
-                and path.suffix.lower() in SUPPORTED_EXTENSIONS
+                if path.suffix.lower() in SUPPORTED_EXTENSIONS
                 and not path.stem.lower().endswith("_256")
             ),
             key=lambda path: (
@@ -61,7 +63,8 @@ class ImageCatalog:
                 resolved_path = cls._resolve_contained_path(root, path)
                 image = read_image(resolved_path, max_pixels)
                 stat = resolved_path.stat()
-            except (ImageDecodeError, ImageTooLargeError, KeyError, OSError):
+            except (ImageDecodeError, ImageTooLargeError, KeyError, OSError) as exc:
+                logger.warning("Skipping source image %s: %s", relative.as_posix(), exc)
                 continue
             normalized = relative.as_posix()
             records.append(
@@ -87,8 +90,8 @@ class ImageCatalog:
         try:
             resolved = path.resolve(strict=True)
             resolved.relative_to(root)
-            if not resolved.is_file():
+            if not stat.S_ISREG(resolved.stat().st_mode):
                 raise KeyError(path)
         except (OSError, ValueError) as exc:
-            raise KeyError(path) from exc
+            raise KeyError(f"{path}: {exc}") from exc
         return resolved

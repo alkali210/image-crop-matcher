@@ -29,6 +29,20 @@ def compressed_png(width: int, height: int) -> bytes:
     return payload.getvalue()
 
 
+@pytest.mark.parametrize("image_format", ["PNG", "JPEG", "WEBP", "BMP"])
+def test_required_formats_round_trip_through_pillow_header_and_opencv(
+    image_format: str,
+) -> None:
+    source = Image.new("RGB", (13, 9), (23, 101, 207))
+    payload = BytesIO()
+    source.save(payload, format=image_format)
+
+    decoded = decode_image_bytes(payload.getvalue(), max_pixels=1_000)
+
+    assert decoded.shape == (9, 13, 3)
+    assert decoded.dtype == np.uint8
+
+
 def test_decode_rejects_invalid_and_excessive_pixels() -> None:
     with pytest.raises(ImageDecodeError):
         decode_image_bytes(b"not-an-image", max_pixels=100)
