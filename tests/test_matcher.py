@@ -444,6 +444,49 @@ def test_benchmark_queries_are_deterministic() -> None:
     assert all(0.10 <= spec.crop_fraction <= 0.40 for spec in first)
 
 
+def test_bounded_benchmark_reuses_isolated_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from benchmarks.benchmark import main
+
+    gallery = tmp_path / "songs"
+    write_png(gallery / "first" / "base.png", make_art(1))
+    write_png(gallery / "second" / "base.png", make_art(2))
+    production_cache = tmp_path / ".cache"
+    production_cache.mkdir()
+    sentinel = production_cache / "full-gallery-sentinel"
+    sentinel.write_text("keep", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    arguments = [
+        "--gallery",
+        str(gallery),
+        "--samples-per-image",
+        "1",
+        "--max-images",
+        "1",
+        "--failure-dir",
+        str(tmp_path / "failures"),
+    ]
+
+    assert main(arguments) == 0
+    capsys.readouterr()
+    namespaces = list((production_cache / "benchmarks").iterdir())
+    assert len(namespaces) == 1
+    manifest = namespaces[0] / "manifest.json"
+    features = namespaces[0] / "features.npz"
+    assert manifest.is_file()
+    assert features.is_file()
+    timestamps = (manifest.stat().st_mtime_ns, features.stat().st_mtime_ns)
+
+    assert main(arguments) == 0
+    capsys.readouterr()
+    assert list((production_cache / "benchmarks").iterdir()) == namespaces
+    assert (manifest.stat().st_mtime_ns, features.stat().st_mtime_ns) == timestamps
+    assert sentinel.read_text("utf-8") == "keep"
+    assert not (production_cache / "manifest.json").exists()
+    assert not (production_cache / "features.npz").exists()
+
+
 def test_benchmark_accuracy_exit_status_uses_95_percent_boundary() -> None:
     from benchmarks.benchmark import accuracy_exit_status
 
@@ -481,6 +524,140 @@ def test_benchmark_failure_json_has_exact_metadata(tmp_path: Path) -> None:
         "similarity": 72.5,
         "latency_ms": 4.568,
     }
+
+
+def test_benchmark_rejects_unowned_failure_run_without_deleting_files(
+    tmp_path: Path,
+) -> None:
+    from benchmarks.benchmark import failure_run_dir, prepare_failure_run_dir
+
+    failure_root = tmp_path / "caller-owned"
+    failure_root.mkdir()
+    caller_failure = failure_root / "failure-caller.json"
+    caller_failure.write_text("keep", encoding="utf-8")
+    gallery = tmp_path / "songs"
+    run_dir = failure_run_dir(failure_root, gallery, 1, 2, 20260730)
+    run_dir.mkdir()
+    run_failure = run_dir / "failure-000001.json"
+    run_failure.write_text("also keep", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="not benchmark-owned"):
+        prepare_failure_run_dir(failure_root, gallery, 1, 2, 20260730)
+
+    assert caller_failure.read_text("utf-8") == "keep"
+    assert run_failure.read_text("utf-8") == "also keep"
+
+
+def test_benchmark_cleans_owned_failure_run_before_catalog_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from benchmarks.benchmark import main, prepare_failure_run_dir
+
+    gallery = tmp_path / "songs"
+    failure_root = tmp_path / "failures"
+    run_dir = prepare_failure_run_dir(failure_root, gallery, 1, 1, 20260730)
+    stale = run_dir / "failure-999999.json"
+    stale.write_text("stale", encoding="utf-8")
+
+    def fail_scan(_cls: type[ImageCatalog], _root: Path, _max_pixels: int) -> None:
+        assert not stale.exists()
+        raise RuntimeError("catalog stopped")
+
+    monkeypatch.setattr(ImageCatalog, "scan", classmethod(fail_scan))
+
+    with pytest.raises(RuntimeError, match="catalog stopped"):
+        main(
+            [
+                "--gallery",
+                str(gallery),
+                "--samples-per-image",
+                "1",
+                "--max-images",
+                "1",
+                "--failure-dir",
+                str(failure_root),
+            ]
+        )
+
+
+def test_benchmark_seeds_opencv_before_catalog_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from benchmarks import benchmark
+
+    calls: list[int] = []
+    monkeypatch.setattr(benchmark.cv2, "setRNGSeed", calls.append)
+
+    def fail_scan(_cls: type[ImageCatalog], _root: Path, _max_pixels: int) -> None:
+        assert calls == [20260730]
+        raise RuntimeError("catalog stopped")
+
+    monkeypatch.setattr(ImageCatalog, "scan", classmethod(fail_scan))
+
+    with pytest.raises(RuntimeError, match="catalog stopped"):
+        benchmark.main(
+            [
+                "--gallery",
+                str(tmp_path / "songs"),
+                "--samples-per-image",
+                "1",
+                "--failure-dir",
+                str(tmp_path / "failures"),
+            ]
+        )
+
+
+def test_benchmark_owned_failure_lifecycle_and_status_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from benchmarks.benchmark import failure_run_dir, main
+    from crop_matcher.matcher import MatchResult
+
+    gallery = tmp_path / "songs"
+    write_png(gallery / "first" / "base.png", make_art(1))
+    write_png(gallery / "second" / "base.png", make_art(2))
+    failure_root = tmp_path / "caller-owned"
+    failure_root.mkdir()
+    caller_failure = failure_root / "failure-caller.json"
+    caller_failure.write_text("keep", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    def always_first(matcher: ImageMatcher, _query: np.ndarray) -> MatchResult:
+        return MatchResult(matcher.catalog.records[0], 55.0, "sift", 4, 1.0, 1.0)
+
+    monkeypatch.setattr(ImageMatcher, "match", always_first)
+    arguments = [
+        "--gallery",
+        str(gallery),
+        "--samples-per-image",
+        "1",
+        "--max-images",
+        "2",
+        "--failure-dir",
+        str(failure_root),
+    ]
+
+    assert main(arguments) == 1
+    capsys.readouterr()
+    run_dir = failure_run_dir(failure_root, gallery, 1, 2, 20260730)
+    assert (run_dir / ".benchmark-owned").is_file()
+    assert caller_failure.read_text("utf-8") == "keep"
+    failures = list(run_dir.glob("failure-*.json"))
+    assert [path.name for path in failures] == ["failure-000002.json"]
+    metadata = json.loads(failures[0].read_text("utf-8"))
+    assert metadata["source_id"] != metadata["predicted_id"]
+
+    stale = run_dir / "failure-999999.json"
+    stale.write_text("stale", encoding="utf-8")
+    owned_non_failure = run_dir / "keep.txt"
+    owned_non_failure.write_text("keep", encoding="utf-8")
+
+    assert main(arguments) == 1
+    capsys.readouterr()
+    assert not stale.exists()
+    assert owned_non_failure.read_text("utf-8") == "keep"
+    assert caller_failure.read_text("utf-8") == "keep"
+    assert [path.name for path in run_dir.glob("failure-*.json")] == ["failure-000002.json"]
 
 
 def test_benchmark_cli_returns_zero_at_accuracy_target(

@@ -87,10 +87,14 @@ While startup is still building, match and image requests return `503`. Invalid 
 
 ## Benchmark
 
-The benchmark generates deterministic color and grayscale crops with seed `20260730`, crop sides
-covering 10%-40% of each source's shorter edge, and output sizes of 64, 90, 128, or 192 pixels. It
-builds one catalog, index, and matcher, performs one untimed warm-up, and reports Top-1 accuracy,
-SIFT/pHash usage, and matcher-only P50/P95 latency.
+The benchmark generates a deterministic crop workload with seed `20260730`: color and grayscale
+crops cover 10%-40% of each source's shorter edge and use output sizes of 64, 90, 128, or 192 pixels.
+It also seeds OpenCV's RNG when that API is available. OpenCV FLANN and RANSAC are approximate,
+however, so repeated runs can have small prediction variations even though the crop specifications
+are identical. Do not expect byte-identical failure sets across OpenCV builds or machines.
+
+The command builds one catalog, index, and matcher, performs one untimed warm-up, and reports Top-1
+accuracy, SIFT/pHash usage, and matcher-only P50/P95 latency.
 
 Start with a bounded smoke run before the complete 796-image run:
 
@@ -99,11 +103,35 @@ python benchmarks/benchmark.py --gallery songs --samples-per-image 1 --max-image
 python benchmarks/benchmark.py --gallery songs --samples-per-image 4 --seed 20260730
 ```
 
+### Accepted Initial Baseline
+
+The measured full 796-image baseline is an **accepted initial limitation**, not a passing 95%
+result:
+
+```text
+images=796 queries=3184
+top1=2325/3184 accuracy=73.02%
+method_sift=2586 method_phash=598
+latency_ms_p50=49.436 latency_ms_p95=305.458
+```
+
+This run recorded 2,325/3,184 correct matches and 859 failures, producing one incorrect-result file
+per failure. Its expected process status is `1` because 73.02% is below the still-aspirational 95%
+threshold. Initial delivery accepts this measured limitation while retaining the nonzero status so
+automation cannot mistake it for a 95% acceptance pass.
+
 Available options are `--gallery`, `--samples-per-image`, `--max-images`, `--seed`, and
-`--failure-dir`. Incorrect matches are written as deterministic `failure-XXXXXX.json` files under
-`benchmark-failures/` by default. Each file records source and predicted IDs, crop coordinates and
-side, output size, grayscale state, similarity, and measured latency. Existing generated failure
-files in that directory are cleared at the beginning of a run.
+`--failure-dir`. A bounded `--max-images` run stores and reuses its index under a deterministic
+`.cache/benchmarks/bounded-<digest>/` namespace based on its bounded catalog and feature settings. It
+never reads or replaces the full-gallery manifest and arrays directly under `.cache/`.
+
+Incorrect matches are written below a deterministic `run-<digest>/` subdirectory of
+`benchmark-failures/` by default. Each run directory contains a benchmark ownership marker. At the
+start of a run, before gallery scanning or warm-up, the benchmark deletes only its own
+`failure-*.json` files directly inside that marked run directory. It does not delete matching files
+from the caller-provided root or other run directories, and it refuses to reuse an unmarked
+directory. Each failure file records source and predicted IDs, crop coordinates and side, output
+size, grayscale state, similarity, and measured latency.
 
 The command exits with status `1` only when Top-1 accuracy is below 95%. Latency is reported for
 operator comparison but never changes the process status because it depends on the machine and

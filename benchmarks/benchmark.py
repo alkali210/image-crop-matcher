@@ -1,6 +1,7 @@
 import argparse
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
+from hashlib import sha256
 import json
 from pathlib import Path
 import random
@@ -19,6 +20,8 @@ from crop_matcher.matcher import ImageMatcher
 DEFAULT_SEED = 20260730
 OUTPUT_SIZES = (64, 90, 128, 192)
 ACCURACY_TARGET = 0.95
+OWNERSHIP_MARKER = ".benchmark-owned"
+OWNERSHIP_CONTENT = "crop-matcher-benchmark-failures-v1\n"
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,8 +107,61 @@ def write_failure(
     return path
 
 
+def failure_run_dir(
+    failure_dir: Path,
+    gallery: Path,
+    samples_per_image: int,
+    max_images: int | None,
+    seed: int,
+) -> Path:
+    identity = {
+        "gallery": gallery.resolve().as_posix(),
+        "samples_per_image": samples_per_image,
+        "max_images": max_images,
+        "seed": seed,
+    }
+    digest = sha256(
+        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:16]
+    return failure_dir / f"run-{digest}"
+
+
+def prepare_failure_run_dir(
+    failure_dir: Path,
+    gallery: Path,
+    samples_per_image: int,
+    max_images: int | None,
+    seed: int,
+) -> Path:
+    failure_dir.mkdir(parents=True, exist_ok=True)
+    run_dir = failure_run_dir(
+        failure_dir,
+        gallery,
+        samples_per_image,
+        max_images,
+        seed,
+    )
+    marker = run_dir / OWNERSHIP_MARKER
+    if run_dir.exists():
+        if not marker.is_file() or marker.read_text("utf-8") != OWNERSHIP_CONTENT:
+            raise RuntimeError(f"Failure run directory is not benchmark-owned: {run_dir}")
+    else:
+        run_dir.mkdir()
+        marker.write_text(OWNERSHIP_CONTENT, encoding="utf-8")
+    for old_failure in run_dir.glob("failure-*.json"):
+        old_failure.unlink()
+    return run_dir
+
+
 def accuracy_exit_status(accuracy: float) -> int:
     return int(accuracy < ACCURACY_TARGET)
+
+
+def _seed_opencv(seed: int) -> None:
+    set_seed = getattr(cv2, "setRNGSeed", None)
+    if callable(set_seed):
+        signed_seed = ((seed + 2**31) % 2**32) - 2**31
+        set_seed(signed_seed)
 
 
 def _limited_catalog(catalog: ImageCatalog, max_images: int | None) -> ImageCatalog:
@@ -116,6 +172,26 @@ def _limited_catalog(catalog: ImageCatalog, max_images: int | None) -> ImageCata
         catalog.records[:max_images],
         catalog.manifest[:max_images],
     )
+
+
+def _bounded_cache_dir(catalog: ImageCatalog, settings: Settings, max_images: int) -> Path:
+    identity = {
+        "gallery": catalog.root.as_posix(),
+        "max_images": max_images,
+        "feature_settings": {
+            "working_max_edge": settings.working_max_edge,
+            "sift_features": settings.sift_features,
+            "sift_contrast_threshold": settings.sift_contrast_threshold,
+            "tile_sizes": list(settings.tile_sizes),
+        },
+        "images": [asdict(entry) for entry in catalog.manifest],
+    }
+    digest = sha256(
+        json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    ).hexdigest()[:16]
+    return settings.cache_dir / "benchmarks" / f"bounded-{digest}"
 
 
 def _query_for(
@@ -134,6 +210,14 @@ def run_benchmark(
     seed: int,
     failure_dir: Path,
 ) -> int:
+    _seed_opencv(seed)
+    run_failure_dir = prepare_failure_run_dir(
+        failure_dir,
+        gallery,
+        samples_per_image,
+        max_images,
+        seed,
+    )
     settings = Settings(gallery_dir=gallery)
     catalog = _limited_catalog(
         ImageCatalog.scan(settings.gallery_dir, settings.max_image_pixels),
@@ -141,6 +225,11 @@ def run_benchmark(
     )
     if not catalog.records:
         raise ValueError(f"Gallery contains no supported source images: {gallery}")
+    if max_images is not None:
+        settings = replace(
+            settings,
+            cache_dir=_bounded_cache_dir(catalog, settings, max_images),
+        )
 
     index = FeatureIndex.load_or_build(catalog, settings)
     matcher = ImageMatcher(catalog, index, settings)
@@ -148,10 +237,6 @@ def run_benchmark(
 
     warmup, *_ = _query_for(catalog.records[0], specs[0], settings.max_image_pixels)
     matcher.match(warmup)
-
-    failure_dir.mkdir(parents=True, exist_ok=True)
-    for old_failure in failure_dir.glob("failure-*.json"):
-        old_failure.unlink()
 
     correct = 0
     method_counts = {"sift": 0, "phash": 0}
@@ -168,7 +253,7 @@ def run_benchmark(
             correct += 1
             continue
         write_failure(
-            failure_dir,
+            run_failure_dir,
             query_number,
             source_id=record.image_id,
             predicted_id=result.record.image_id,
