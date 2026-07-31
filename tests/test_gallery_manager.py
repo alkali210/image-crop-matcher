@@ -14,6 +14,7 @@ from crop_matcher.gallery_manager import (
     GalleryConflictError,
     GalleryManager,
     GalleryPathError,
+    GallerySnapshot,
 )
 from crop_matcher.gallery_state import GallerySelectionStore, gallery_cache_dir
 from crop_matcher.matcher import ImageMatcher
@@ -218,6 +219,57 @@ def test_failed_selection_save_rolls_back_built_gallery(
     assert snapshot.active is old
     assert snapshot.pending_gallery_dir is None
     assert snapshot.switch_error == "Failed to switch gallery"
+
+
+def test_snapshot_keeps_old_bundle_available_while_selection_save_is_blocked(
+    tmp_path: Path, first_gallery: Path, second_gallery: Path
+) -> None:
+    settings = Settings(gallery_dir=first_gallery, cache_dir=tmp_path / "cache")
+    save_started = Event()
+    save_released = Event()
+
+    class BlockingStore(GallerySelectionStore):
+        def save(self, gallery_dir: Path) -> None:
+            save_started.set()
+            assert save_released.wait(timeout=5)
+
+    manager = GalleryManager(
+        settings,
+        BlockingStore(tmp_path / "selection.json"),
+        builder=lambda gallery_dir, cache_dir: make_bundle(gallery_dir, cache_dir, settings),
+    )
+    manager.initialize(first_gallery)
+    old = manager.snapshot().active
+    manager.reserve_switch(second_gallery)
+    switch_worker = Thread(target=manager.run_reserved_switch, args=(second_gallery,))
+    switch_worker.start()
+    assert save_started.wait(timeout=5)
+
+    observed: list[GallerySnapshot] = []
+    snapshot_finished = Event()
+
+    def read_snapshot() -> None:
+        observed.append(manager.snapshot())
+        snapshot_finished.set()
+
+    snapshot_worker = Thread(target=read_snapshot)
+    snapshot_worker.start()
+    available_during_save = snapshot_finished.wait(timeout=1)
+    try:
+        if available_during_save:
+            assert observed[0].active is old
+            assert observed[0].pending_gallery_dir == second_gallery.resolve()
+    finally:
+        save_released.set()
+        snapshot_worker.join(timeout=5)
+        switch_worker.join(timeout=5)
+
+    assert available_during_save
+    assert not snapshot_worker.is_alive()
+    assert not switch_worker.is_alive()
+    final = manager.snapshot()
+    assert final.active is not None
+    assert final.active.gallery_dir == second_gallery.resolve()
 
 
 def test_removed_reserved_gallery_clears_pending_switch(

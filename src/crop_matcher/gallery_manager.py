@@ -148,10 +148,13 @@ class GalleryManager:
         with self._lock:
             if self._pending_generation is not generation:
                 return
-            try:
-                self.selection_store.save(reserved)
-            except Exception:
-                logger.exception("Failed to switch galleries")
+        try:
+            self.selection_store.save(reserved)
+        except Exception:
+            logger.exception("Failed to switch galleries")
+            with self._lock:
+                if self._pending_generation is not generation:
+                    return
                 self._pending_generation = None
                 self._pending_worker_paths = ()
                 self._snapshot = replace(
@@ -159,10 +162,14 @@ class GalleryManager:
                     pending_gallery_dir=None,
                     switch_error="Failed to switch gallery",
                 )
-            else:
-                self._pending_generation = None
-                self._pending_worker_paths = ()
-                self._snapshot = GallerySnapshot("ready", bundle, None, None, None)
+            return
+
+        with self._lock:
+            if self._pending_generation is not generation:
+                return
+            self._pending_generation = None
+            self._pending_worker_paths = ()
+            self._snapshot = GallerySnapshot("ready", bundle, None, None, None)
 
     def _build_bundle(self, gallery_dir: Path, cache_dir: Path) -> GalleryBundle:
         started = time.perf_counter()
