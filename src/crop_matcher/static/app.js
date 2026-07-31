@@ -121,6 +121,58 @@ function renderStatusUnavailable() {
   setUploadEnabled(state.hasActiveGallery);
 }
 
+function isValidStatusResponse(status) {
+  if (status === null || typeof status !== "object" || Array.isArray(status)) {
+    return false;
+  }
+  if (!new Set(["building", "ready", "error"]).has(status.state)) {
+    return false;
+  }
+  if (!Number.isInteger(status.indexed_images) || status.indexed_images < 0) {
+    return false;
+  }
+  if (
+    status.build_time_ms !== null &&
+    (!Number.isInteger(status.build_time_ms) || status.build_time_ms < 0)
+  ) {
+    return false;
+  }
+  if (
+    ![status.error, status.switch_error].every(
+      (value) => value === null || typeof value === "string",
+    )
+  ) {
+    return false;
+  }
+  if (
+    ![status.gallery_dir, status.pending_gallery_dir].every(
+      (value) => value === null || (typeof value === "string" && value.trim() !== ""),
+    ) ||
+    typeof status.reindexing !== "boolean"
+  ) {
+    return false;
+  }
+
+  if (status.state === "ready") {
+    return (
+      status.gallery_dir !== null &&
+      status.build_time_ms !== null &&
+      status.error === null &&
+      status.reindexing === (status.pending_gallery_dir !== null) &&
+      !(status.reindexing && status.switch_error !== null)
+    );
+  }
+  return (
+    status.indexed_images === 0 &&
+    status.build_time_ms === null &&
+    status.gallery_dir === null &&
+    status.pending_gallery_dir === null &&
+    status.reindexing === false &&
+    status.switch_error === null &&
+    (status.state !== "building" || status.error === null)
+  );
+}
+
 async function pollStatus() {
   if (state.statusPending) {
     scheduleStatusPoll();
@@ -139,6 +191,9 @@ async function pollStatus() {
     const status = await response.json();
     if (generation !== state.statusGeneration) {
       return;
+    }
+    if (!isValidStatusResponse(status)) {
+      throw new Error("无法读取索引状态");
     }
     renderStatus(status);
     renderGalleryStatus(status);
@@ -366,12 +421,7 @@ async function submitGallery(event) {
         typeof apiMessage === "string" && apiMessage.trim() ? apiMessage : "无法切换图库",
       );
     }
-    if (
-      status === null ||
-      typeof status !== "object" ||
-      Array.isArray(status) ||
-      typeof status.reindexing !== "boolean"
-    ) {
+    if (!isValidStatusResponse(status)) {
       throw new Error("无法读取切换状态");
     }
     renderStatus(status);

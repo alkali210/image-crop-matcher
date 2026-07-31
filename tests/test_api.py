@@ -696,7 +696,7 @@ const assert = (condition, message) => { if (!condition) throw new Error(message
 
 (async () => {
   responses.push(jsonResponse({
-    state: "building", indexed_images: 0, gallery_dir: "C:\\not-active-yet",
+    state: "building", indexed_images: 0, build_time_ms: null, error: null, gallery_dir: null,
     pending_gallery_dir: null, reindexing: false, switch_error: null,
   }));
   await context.pollStatus();
@@ -711,7 +711,7 @@ const assert = (condition, message) => { if (!condition) throw new Error(message
   assert(timerCallback !== null, "status failure did not schedule retry");
 
   responses.push(jsonResponse({
-    state: "ready", indexed_images: 3, gallery_dir: "C:\\active",
+    state: "ready", indexed_images: 3, build_time_ms: 4, error: null, gallery_dir: "C:\\active",
     pending_gallery_dir: "C:\\pending", reindexing: true, switch_error: null,
   }));
   await context.pollStatus();
@@ -727,7 +727,7 @@ const assert = (condition, message) => { if (!condition) throw new Error(message
   assert(elements.get("#switch-gallery-button").disabled, "submission did not disable switch");
 
   responses.push(jsonResponse({
-    state: "ready", indexed_images: 3, gallery_dir: "C:\\active",
+    state: "ready", indexed_images: 3, build_time_ms: 4, error: null, gallery_dir: "C:\\active",
     pending_gallery_dir: null, reindexing: false, switch_error: null,
   }));
   await context.pollStatus();
@@ -735,7 +735,7 @@ const assert = (condition, message) => { if (!condition) throw new Error(message
   resolveSubmission({
     ok: true,
     json: async () => ({
-      state: "ready", indexed_images: 3, gallery_dir: "C:\\active",
+      state: "ready", indexed_images: 3, build_time_ms: 4, error: null, gallery_dir: "C:\\active",
       pending_gallery_dir: "C:\\next", reindexing: true, switch_error: null,
     }),
   });
@@ -744,7 +744,7 @@ const assert = (condition, message) => { if (!condition) throw new Error(message
   assert(!elements.get("#file-input").disabled, "accepted switch disabled active upload");
 
   responses.push(jsonResponse({
-    state: "ready", indexed_images: 3, gallery_dir: "C:\\active",
+    state: "ready", indexed_images: 3, build_time_ms: 4, error: null, gallery_dir: "C:\\active",
     pending_gallery_dir: null, reindexing: false, switch_error: "No supported images found",
   }));
   await context.pollStatus();
@@ -789,7 +789,7 @@ let timerCallback = null;
 let resolveOldPoll;
 const responses = [
   () => new Promise((resolve) => { resolveOldPoll = resolve; }),
-  async () => ({ ok: true, json: async () => ({ state: "ready", indexed_images: 1, gallery_dir: "C:\\old", pending_gallery_dir: "C:\\new", reindexing: true, switch_error: null }) }),
+  async () => ({ ok: true, json: async () => ({ state: "ready", indexed_images: 1, build_time_ms: 4, error: null, gallery_dir: "C:\\old", pending_gallery_dir: "C:\\new", reindexing: true, switch_error: null }) }),
 ];
 const context = {
   console,
@@ -805,7 +805,7 @@ const assert = (condition, message) => { if (!condition) throw new Error(message
   elements.get("#gallery-path").value = "C:\\new";
   const submission = elements.get("#gallery-switch-form").listeners.submit({ preventDefault() {} });
   await submission;
-  resolveOldPoll({ ok: true, json: async () => ({ state: "ready", indexed_images: 1, gallery_dir: "C:\\old", pending_gallery_dir: null, reindexing: false, switch_error: null }) });
+  resolveOldPoll({ ok: true, json: async () => ({ state: "ready", indexed_images: 1, build_time_ms: 4, error: null, gallery_dir: "C:\\old", pending_gallery_dir: null, reindexing: false, switch_error: null }) });
   await oldPoll; await flush();
   assert(elements.get("#switch-gallery-button").disabled, "stale pre-reservation poll enabled switching");
   assert(timerCallback !== null, "stale pre-reservation poll stopped accepted-switch polling");
@@ -837,8 +837,8 @@ elements.get("#loading-status").hidden = true; elements.get("#gallery-path").val
 let timerCallback = null;
 const responses = [
   async () => { throw new Error("response lost"); },
-  async () => ({ ok: true, json: async () => ({ state: "ready", indexed_images: 1, gallery_dir: "C:\\old", pending_gallery_dir: "C:\\new", reindexing: true, switch_error: null }) }),
-  async () => ({ ok: true, json: async () => ({ state: "ready", indexed_images: 2, gallery_dir: "C:\\new", pending_gallery_dir: null, reindexing: false, switch_error: null }) }),
+  async () => ({ ok: true, json: async () => ({ state: "ready", indexed_images: 1, build_time_ms: 4, error: null, gallery_dir: "C:\\old", pending_gallery_dir: "C:\\new", reindexing: true, switch_error: null }) }),
+  async () => ({ ok: true, json: async () => ({ state: "ready", indexed_images: 2, build_time_ms: 5, error: null, gallery_dir: "C:\\new", pending_gallery_dir: null, reindexing: false, switch_error: null }) }),
 ];
 const context = {
   console, Error, document: { createElement() { return new Element(); }, createTextNode(text) { return { textContent: text }; }, querySelector(selector) { return elements.get(selector); } },
@@ -858,6 +858,58 @@ const assert = (condition, message) => { if (!condition) throw new Error(message
   poll = timerCallback; poll(); await new Promise((resolve) => setImmediate(resolve));
   assert(!elements.get("#switch-gallery-button").disabled, "completed authoritative status did not enable submission");
   assert(timerCallback === null, "completed authoritative status kept polling");
+})().catch((error) => { console.error(error.stack || error); process.exitCode = 1; });
+"""
+    subprocess.run(
+        ["node", "-e", harness, str(app_script)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_frontend_rejects_incomplete_status_for_submission_and_polling() -> None:
+    app_script = Path(__file__).parents[1] / "src" / "crop_matcher" / "static" / "app.js"
+    harness = r"""
+const fs = require("fs"); const vm = require("vm");
+class Element {
+  constructor() { this.attrs = new Map(); this.dataset = {}; this.disabled = false; this.files = []; this.hidden = true; this.listeners = {}; this.textContent = ""; this.value = ""; }
+  addEventListener(name, callback) { this.listeners[name] = callback; }
+  append() {} click() {} contains() { return false; } focus() {}
+  getAttribute(name) { return this.attrs.has(name) ? this.attrs.get(name) : null; }
+  removeAttribute(name) { this.attrs.delete(name); } replaceChildren() {}
+  setAttribute(name, value) { this.attrs.set(name, String(value)); }
+}
+const selectors = ["#drop-zone", "#file-input", "#index-status", "#status-text", "#loading-status", "#error-message", "#upload-view", "#results-view", "#results-heading", "#query-summary", "#query-preview", "#query-name", "#query-meta", "#result-list", "#reupload-button", "#current-gallery-path", "#gallery-switch-form", "#gallery-path", "#switch-gallery-button", "#gallery-switch-status"];
+const elements = new Map(selectors.map((selector) => [selector, new Element()]));
+elements.get("#loading-status").hidden = true; elements.get("#gallery-path").value = "C:\\new";
+let timerCallback = null;
+const responses = [
+  async () => ({ ok: true, json: async () => ({ reindexing: false }) }),
+  async () => ({ ok: true, json: async () => ({ state: "ready", indexed_images: 2, build_time_ms: 4, error: null, gallery_dir: "C:\\new", pending_gallery_dir: null, reindexing: false, switch_error: null }) }),
+  async () => ({ ok: true, json: async () => ({ reindexing: false }) }),
+];
+const context = {
+  console, Error, document: { createElement() { return new Element(); }, createTextNode(text) { return { textContent: text }; }, querySelector(selector) { return elements.get(selector); } },
+  fetch: (...args) => responses.shift()(...args), FormData: class { append() {} }, URL,
+  window: { addEventListener() {}, clearTimeout() { timerCallback = null; }, location: { origin: "http://testserver" }, setTimeout(callback) { timerCallback = () => { timerCallback = null; callback(); }; return 1; } },
+};
+vm.createContext(context); vm.runInContext(fs.readFileSync(process.argv[1], "utf8"), context);
+const assert = (condition, message) => { if (!condition) throw new Error(message); };
+(async () => {
+  assert(context.isValidStatusResponse({ state: "building", indexed_images: 0, build_time_ms: null, error: null, gallery_dir: null, pending_gallery_dir: null, reindexing: false, switch_error: null }), "legitimate building status was rejected");
+  assert(context.isValidStatusResponse({ state: "error", indexed_images: 0, build_time_ms: null, error: "No supported images found", gallery_dir: null, pending_gallery_dir: null, reindexing: false, switch_error: null }), "legitimate error status was rejected");
+  context.renderStatus({ state: "ready", indexed_images: 1, build_time_ms: 3, error: null, gallery_dir: "C:\\old", pending_gallery_dir: null, reindexing: false, switch_error: null });
+  await elements.get("#gallery-switch-form").listeners.submit({ preventDefault() {} });
+  assert(elements.get("#switch-gallery-button").disabled, "incomplete POST status enabled another submission");
+  assert(timerCallback !== null, "incomplete POST status did not schedule reconciliation");
+  assert(!elements.get("#file-input").disabled, "incomplete POST status disabled known active upload");
+  let poll = timerCallback; poll(); await new Promise((resolve) => setImmediate(resolve));
+  assert(!elements.get("#switch-gallery-button").disabled, "valid reconciliation did not unlock submission");
+  assert(!elements.get("#file-input").disabled, "valid reconciliation disabled active upload");
+  await context.pollStatus();
+  assert(!elements.get("#file-input").disabled, "incomplete poll disabled known active upload");
+  assert(timerCallback !== null, "incomplete poll did not schedule retry");
 })().catch((error) => { console.error(error.stack || error); process.exitCode = 1; });
 """
     subprocess.run(
