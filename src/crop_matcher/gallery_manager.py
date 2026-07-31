@@ -61,6 +61,8 @@ class GalleryManager:
         self._builder = builder or self._build_bundle
         self._lock = Lock()
         self._snapshot = GallerySnapshot("building", None, None, None, None)
+        self._pending_generation: object | None = None
+        self._pending_worker_paths: tuple[Path, ...] = ()
 
     def snapshot(self) -> GallerySnapshot:
         with self._lock:
@@ -84,10 +86,14 @@ class GalleryManager:
                 else "Failed to initialize image index"
             )
             with self._lock:
+                self._pending_generation = None
+                self._pending_worker_paths = ()
                 self._snapshot = GallerySnapshot("error", None, None, None, message)
             return
 
         with self._lock:
+            self._pending_generation = None
+            self._pending_worker_paths = ()
             self._snapshot = GallerySnapshot("ready", bundle, None, None, None)
 
     def reserve_switch(self, path: Path) -> Literal["active", "accepted"]:
@@ -100,6 +106,8 @@ class GalleryManager:
                 raise GalleryConflictError("A gallery switch is already in progress")
             if snapshot.active is not None and snapshot.active.gallery_dir == resolved:
                 return "active"
+            self._pending_generation = object()
+            self._pending_worker_paths = (path, resolved)
             self._snapshot = replace(
                 snapshot,
                 pending_gallery_dir=resolved,
@@ -109,6 +117,11 @@ class GalleryManager:
 
     def run_reserved_switch(self, path: Path) -> None:
         with self._lock:
+            generation = self._pending_generation
+            if generation is None or not any(
+                path is worker_path for worker_path in self._pending_worker_paths
+            ):
+                return
             reserved = self._snapshot.pending_gallery_dir
         try:
             candidate = path.resolve(strict=False)
@@ -118,12 +131,13 @@ class GalleryManager:
                 raise GalleryPathError("Gallery path must be a directory")
             cache_dir = gallery_cache_dir(self.settings.cache_dir, reserved)
             bundle = self._builder(reserved, cache_dir)
-            self.selection_store.save(reserved)
         except Exception:
             logger.exception("Failed to switch galleries")
             with self._lock:
                 snapshot = self._snapshot
-                if reserved is not None and snapshot.pending_gallery_dir is reserved:
+                if self._pending_generation is generation:
+                    self._pending_generation = None
+                    self._pending_worker_paths = ()
                     self._snapshot = replace(
                         snapshot,
                         pending_gallery_dir=None,
@@ -132,9 +146,23 @@ class GalleryManager:
             return
 
         with self._lock:
-            if self._snapshot.pending_gallery_dir is not reserved:
+            if self._pending_generation is not generation:
                 return
-            self._snapshot = GallerySnapshot("ready", bundle, None, None, None)
+            try:
+                self.selection_store.save(reserved)
+            except Exception:
+                logger.exception("Failed to switch galleries")
+                self._pending_generation = None
+                self._pending_worker_paths = ()
+                self._snapshot = replace(
+                    self._snapshot,
+                    pending_gallery_dir=None,
+                    switch_error="Failed to switch gallery",
+                )
+            else:
+                self._pending_generation = None
+                self._pending_worker_paths = ()
+                self._snapshot = GallerySnapshot("ready", bundle, None, None, None)
 
     def _build_bundle(self, gallery_dir: Path, cache_dir: Path) -> GalleryBundle:
         started = time.perf_counter()

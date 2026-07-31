@@ -264,6 +264,32 @@ def test_retargeted_reserved_path_clears_only_its_pending_switch(
     assert snapshot.switch_error == "Failed to switch gallery"
 
 
+def test_delayed_worker_cannot_claim_newer_equal_path_reservation(
+    manager: GalleryManager, first_gallery: Path, second_gallery: Path
+) -> None:
+    manager.initialize(first_gallery)
+    old = manager.snapshot().active
+    manager.reserve_switch(second_gallery)
+    delayed_worker_path = manager.snapshot().pending_gallery_dir
+    assert delayed_worker_path is not None
+
+    shutil.rmtree(second_gallery)
+    manager.run_reserved_switch(delayed_worker_path)
+    second_gallery.mkdir()
+    manager.reserve_switch(second_gallery)
+    newer_reservation = manager.snapshot().pending_gallery_dir
+    assert newer_reservation is not None
+    assert newer_reservation == delayed_worker_path
+    assert newer_reservation is not delayed_worker_path
+
+    manager.run_reserved_switch(delayed_worker_path)
+
+    snapshot = manager.snapshot()
+    assert snapshot.active is old
+    assert snapshot.pending_gallery_dir is newer_reservation
+    assert snapshot.switch_error is None
+
+
 def test_gallery_switch_conflicts_while_initial_bundle_is_building(
     tmp_path: Path, first_gallery: Path, second_gallery: Path
 ) -> None:
