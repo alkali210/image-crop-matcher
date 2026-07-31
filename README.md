@@ -91,8 +91,10 @@ The application exposes four API routes:
   `400` for an invalid path, or `409` when another startup/build switch is in progress.
 - `POST /api/match` accepts one multipart field named `file` and returns query dimensions, elapsed
   time, and up to three ranked entries in `matches`.
-- `GET /api/images/{image_id}` returns the trusted original gallery file for an ID returned by the
-  matcher. Unknown IDs return `404`.
+- `GET /api/images/{gallery_id}/{image_id}` returns the trusted original gallery file for a
+  namespaced URL returned by the matcher. Links remain available for the active and immediately
+  previous gallery; after later successful switches, older links safely expire with `404` instead
+  of resolving against another gallery.
 
 Example PowerShell request:
 

@@ -350,6 +350,7 @@ async function submitGallery(event) {
   setGalleryPending(true);
   setGallerySwitchMessage(`正在请求切换：${path}`, "pending");
   let remainsPending = false;
+  let ambiguousFailure = true;
 
   try {
     const response = await fetch("/api/gallery", {
@@ -359,10 +360,19 @@ async function submitGallery(event) {
     });
     const status = await parseJsonResponse(response);
     if (!response.ok) {
+      ambiguousFailure = false;
       const apiMessage = status?.error?.message;
       throw new Error(
         typeof apiMessage === "string" && apiMessage.trim() ? apiMessage : "无法切换图库",
       );
+    }
+    if (
+      status === null ||
+      typeof status !== "object" ||
+      Array.isArray(status) ||
+      typeof status.reindexing !== "boolean"
+    ) {
+      throw new Error("无法读取切换状态");
     }
     renderStatus(status);
     renderGalleryStatus(status);
@@ -375,6 +385,10 @@ async function submitGallery(event) {
   } catch (error) {
     const detail = error instanceof Error ? error.message : "无法切换图库";
     setGallerySwitchMessage(`图库切换失败：${detail}。当前图库仍可使用。`, "error");
+    if (ambiguousFailure) {
+      remainsPending = true;
+      scheduleStatusPoll();
+    }
   } finally {
     state.gallerySubmitting = false;
     setGalleryPending(remainsPending);

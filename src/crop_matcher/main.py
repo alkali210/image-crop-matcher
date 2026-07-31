@@ -175,6 +175,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/images/{gallery_id}/{image_id}")
     async def get_image(gallery_id: str, image_id: str) -> FileResponse:
+        snapshot = manager.snapshot()
+        if snapshot.active is None:
+            raise ApiError(503, "service_unavailable", "The image index is not ready")
         try:
             catalog = manager.image_catalog(gallery_id)
             record = catalog.get(image_id)

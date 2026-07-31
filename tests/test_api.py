@@ -255,6 +255,56 @@ def test_image_delivery_returns_404_for_catalog_path_outside_gallery(tmp_path: P
     assert response.json()["error"]["code"] == "image_not_found"
 
 
+def test_image_delivery_is_unavailable_during_initial_build(tmp_path: Path) -> None:
+    (tmp_path / "songs").mkdir()
+    app = create_app(
+        Settings(
+            gallery_dir=tmp_path / "songs",
+            cache_dir=tmp_path / "cache",
+            selection_file=tmp_path / "selection.json",
+        )
+    )
+    manager = app.state.gallery_manager
+    started = Event()
+    released = Event()
+
+    def blocking_builder(_gallery_dir: Path, _cache_dir: Path) -> None:
+        started.set()
+        assert released.wait(timeout=5)
+        raise RuntimeError("expected build stop")
+
+    manager._builder = blocking_builder
+    try:
+        with TestClient(app) as client:
+            assert started.wait(timeout=5)
+            response = client.get("/api/images/gallery/image")
+            assert response.status_code == 503
+            assert response.json()["error"] == {
+                "code": "service_unavailable",
+                "message": "The image index is not ready",
+            }
+            released.set()
+    finally:
+        released.set()
+
+
+def test_image_delivery_is_unavailable_after_initial_build_error(tmp_path: Path) -> None:
+    settings = Settings(
+        gallery_dir=tmp_path / "missing",
+        cache_dir=tmp_path / "cache",
+        selection_file=tmp_path / "selection.json",
+    )
+    with TestClient(create_app(settings)) as client:
+        assert wait_until_ready(client)["state"] == "error"
+        response = client.get("/api/images/gallery/image")
+
+    assert response.status_code == 503
+    assert response.json()["error"] == {
+        "code": "service_unavailable",
+        "message": "The image index is not ready",
+    }
+
+
 def test_rejects_invalid_oversized_and_excessive_pixel_uploads(tmp_path: Path) -> None:
     with make_client(tmp_path, max_upload_bytes=10_000, max_image_pixels=50_000) as client:
         assert wait_until_ready(client)["state"] == "ready"
@@ -759,6 +809,55 @@ const assert = (condition, message) => { if (!condition) throw new Error(message
   await oldPoll; await flush();
   assert(elements.get("#switch-gallery-button").disabled, "stale pre-reservation poll enabled switching");
   assert(timerCallback !== null, "stale pre-reservation poll stopped accepted-switch polling");
+})().catch((error) => { console.error(error.stack || error); process.exitCode = 1; });
+"""
+    subprocess.run(
+        ["node", "-e", harness, str(app_script)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_frontend_reconciles_ambiguous_gallery_submission_failure() -> None:
+    app_script = Path(__file__).parents[1] / "src" / "crop_matcher" / "static" / "app.js"
+    harness = r"""
+const fs = require("fs"); const vm = require("vm");
+class Element {
+  constructor() { this.attrs = new Map(); this.dataset = {}; this.disabled = false; this.files = []; this.hidden = true; this.listeners = {}; this.textContent = ""; this.value = ""; }
+  addEventListener(name, callback) { this.listeners[name] = callback; }
+  append() {} click() {} contains() { return false; } focus() {}
+  getAttribute(name) { return this.attrs.has(name) ? this.attrs.get(name) : null; }
+  removeAttribute(name) { this.attrs.delete(name); } replaceChildren() {}
+  setAttribute(name, value) { this.attrs.set(name, String(value)); }
+}
+const selectors = ["#drop-zone", "#file-input", "#index-status", "#status-text", "#loading-status", "#error-message", "#upload-view", "#results-view", "#results-heading", "#query-summary", "#query-preview", "#query-name", "#query-meta", "#result-list", "#reupload-button", "#current-gallery-path", "#gallery-switch-form", "#gallery-path", "#switch-gallery-button", "#gallery-switch-status"];
+const elements = new Map(selectors.map((selector) => [selector, new Element()]));
+elements.get("#loading-status").hidden = true; elements.get("#gallery-path").value = "C:\\new";
+let timerCallback = null;
+const responses = [
+  async () => { throw new Error("response lost"); },
+  async () => ({ ok: true, json: async () => ({ state: "ready", indexed_images: 1, gallery_dir: "C:\\old", pending_gallery_dir: "C:\\new", reindexing: true, switch_error: null }) }),
+  async () => ({ ok: true, json: async () => ({ state: "ready", indexed_images: 2, gallery_dir: "C:\\new", pending_gallery_dir: null, reindexing: false, switch_error: null }) }),
+];
+const context = {
+  console, Error, document: { createElement() { return new Element(); }, createTextNode(text) { return { textContent: text }; }, querySelector(selector) { return elements.get(selector); } },
+  fetch: (...args) => responses.shift()(...args), FormData: class { append() {} }, URL,
+  window: { addEventListener() {}, clearTimeout() { timerCallback = null; }, location: { origin: "http://testserver" }, setTimeout(callback) { timerCallback = () => { timerCallback = null; callback(); }; return 1; } },
+};
+vm.createContext(context); vm.runInContext(fs.readFileSync(process.argv[1], "utf8"), context);
+const assert = (condition, message) => { if (!condition) throw new Error(message); };
+(async () => {
+  await elements.get("#gallery-switch-form").listeners.submit({ preventDefault() {} });
+  assert(elements.get("#switch-gallery-button").disabled, "ambiguous failure enabled another submission");
+  assert(timerCallback !== null, "ambiguous failure did not schedule reconciliation");
+  assert(elements.get("#gallery-switch-status").textContent.includes("response lost"), "immediate error was lost");
+  let poll = timerCallback; poll(); await new Promise((resolve) => setImmediate(resolve));
+  assert(elements.get("#switch-gallery-button").disabled, "pending authoritative status enabled submission");
+  assert(timerCallback !== null, "pending authoritative status stopped polling");
+  poll = timerCallback; poll(); await new Promise((resolve) => setImmediate(resolve));
+  assert(!elements.get("#switch-gallery-button").disabled, "completed authoritative status did not enable submission");
+  assert(timerCallback === null, "completed authoritative status kept polling");
 })().catch((error) => { console.error(error.stack || error); process.exitCode = 1; });
 """
     subprocess.run(
