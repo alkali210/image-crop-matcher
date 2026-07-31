@@ -3,6 +3,7 @@ songs/
 .agents/
 .worktrees/
 .cache/
+.crop-matcher.json
 .pytest_cache/
 .ruff_cache/
 __pycache__/

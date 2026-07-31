@@ -6,6 +6,7 @@ from pathlib import Path
 class Settings:
     gallery_dir: Path = Path("songs")
     cache_dir: Path = Path(".cache")
+    selection_file: Path = Path(".crop-matcher.json")
     max_upload_bytes: int = 10 * 1024 * 1024
     max_image_pixels: int = 25_000_000
     working_max_edge: int = 512
