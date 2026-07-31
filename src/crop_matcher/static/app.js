@@ -9,6 +9,7 @@ const state = {
   queryUrl: null,
   statusTimer: null,
   statusPending: false,
+  statusGeneration: 0,
   galleryPending: false,
   gallerySubmitting: false,
   hasActiveGallery: false,
@@ -122,11 +123,13 @@ function renderStatusUnavailable() {
 
 async function pollStatus() {
   if (state.statusPending) {
+    scheduleStatusPoll();
     return;
   }
 
   clearStatusTimer();
   state.statusPending = true;
+  const generation = state.statusGeneration;
 
   try {
     const response = await fetch("/api/status");
@@ -134,12 +137,18 @@ async function pollStatus() {
       throw new Error("无法读取索引状态");
     }
     const status = await response.json();
+    if (generation !== state.statusGeneration) {
+      return;
+    }
     renderStatus(status);
     renderGalleryStatus(status);
     if (status.state === "building" || status.reindexing) {
       scheduleStatusPoll();
     }
   } catch (_error) {
+    if (generation !== state.statusGeneration) {
+      return;
+    }
     renderStatusUnavailable();
     scheduleStatusPoll();
   } finally {
@@ -337,6 +346,7 @@ async function submitGallery(event) {
   }
 
   state.gallerySubmitting = true;
+  state.statusGeneration += 1;
   setGalleryPending(true);
   setGallerySwitchMessage(`正在请求切换：${path}`, "pending");
   let remainsPending = false;

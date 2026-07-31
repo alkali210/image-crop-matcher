@@ -445,8 +445,11 @@ def test_match_many_merges_distinct_results_in_deterministic_order(
         MatchResult(records[1], 80.0, "sift", 4, 1.0, 0.8),
     ]
 
-    def fallback(_query: np.ndarray, exclude_ids: set[str]) -> list[MatchResult]:
+    def fallback(
+        _query: np.ndarray, exclude_ids: set[str], requested_count: int
+    ) -> list[MatchResult]:
         assert exclude_ids == {"a", "b"}
+        assert requested_count == 1
         return [
             MatchResult(records[0], 99.0, "phash", 0, 0.0, 0.9),
             MatchResult(records[2], 90.0, "phash", 0, 0.0, 0.9),
@@ -476,6 +479,25 @@ def test_match_many_returns_all_results_when_gallery_has_fewer_than_limit(tmp_pa
 
     assert len(results) == 2
     assert len({result.record.image_id for result in results}) == 2
+
+
+def test_match_many_fallback_fills_limit_beyond_candidate_count(tmp_path: Path) -> None:
+    gallery = tmp_path / "songs"
+    for seed in range(3):
+        write_png(gallery / f"song-{seed}" / "base.png", np.full((32, 32, 3), seed * 60, np.uint8))
+    settings = Settings(
+        gallery_dir=gallery,
+        cache_dir=tmp_path / "cache",
+        candidate_count=1,
+    )
+    catalog = ImageCatalog.scan(gallery, settings.max_image_pixels)
+    matcher = ImageMatcher(catalog, FeatureIndex.load_or_build(catalog, settings), settings)
+
+    results = matcher.match_many(np.zeros((8, 8, 3), np.uint8), limit=3)
+
+    assert len(results) == 3
+    assert len({result.record.image_id for result in results}) == 3
+    assert all(result.method == "phash" for result in results)
 
 
 def test_match_remains_first_match_many_result(tmp_path: Path) -> None:

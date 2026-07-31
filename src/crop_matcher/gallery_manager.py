@@ -63,10 +63,15 @@ class GalleryManager:
         self._snapshot = GallerySnapshot("building", None, None, None, None)
         self._pending_generation: object | None = None
         self._pending_worker_paths: tuple[Path, ...] = ()
+        self._image_catalogs: dict[str, ImageCatalog] = {}
 
     def snapshot(self) -> GallerySnapshot:
         with self._lock:
             return self._snapshot
+
+    def image_catalog(self, gallery_id: str) -> ImageCatalog:
+        with self._lock:
+            return self._image_catalogs[gallery_id]
 
     def initialize(self, gallery_dir: Path | None = None) -> None:
         try:
@@ -95,6 +100,7 @@ class GalleryManager:
             self._pending_generation = None
             self._pending_worker_paths = ()
             self._snapshot = GallerySnapshot("ready", bundle, None, None, None)
+            self._image_catalogs = {bundle.cache_dir.name: bundle.catalog}
 
     def reserve_switch(self, path: Path) -> Literal["active", "accepted"]:
         resolved = self._resolve_switch_path(path)
@@ -167,9 +173,18 @@ class GalleryManager:
         with self._lock:
             if self._pending_generation is not generation:
                 return
+            previous = self._snapshot.active
             self._pending_generation = None
             self._pending_worker_paths = ()
             self._snapshot = GallerySnapshot("ready", bundle, None, None, None)
+            self._image_catalogs = {
+                bundle.cache_dir.name: bundle.catalog,
+                **(
+                    {previous.cache_dir.name: previous.catalog}
+                    if previous is not None and previous.cache_dir.name != bundle.cache_dir.name
+                    else {}
+                ),
+            }
 
     def _build_bundle(self, gallery_dir: Path, cache_dir: Path) -> GalleryBundle:
         started = time.perf_counter()

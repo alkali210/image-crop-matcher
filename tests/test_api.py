@@ -42,6 +42,7 @@ def make_client(tmp_path: Path, **setting_overrides: Any) -> TestClient:
     settings = Settings(
         gallery_dir=gallery,
         cache_dir=tmp_path / "cache",
+        selection_file=tmp_path / "selection.json",
         **setting_overrides,
     )
     return TestClient(create_app(settings))
@@ -122,12 +123,83 @@ def test_status_match_and_safe_image_delivery(tmp_path: Path) -> None:
         image_response = client.get(body["matches"][0]["image_url"])
         assert image_response.status_code == 200
         assert image_response.headers["content-type"].startswith("image/")
-        unknown = client.get("/api/images/not-a-catalog-id")
+        gallery_image_prefix = body["matches"][0]["image_url"].rsplit("/", 1)[0]
+        unknown = client.get(f"{gallery_image_prefix}/not-a-catalog-id")
         assert unknown.status_code == 404
         assert unknown.json() == {
             "error": {"code": "image_not_found", "message": "Image not found"}
         }
-        assert client.get("/api/images/../../outside").status_code in {404, 422}
+        assert client.get(f"{gallery_image_prefix}/../../outside").status_code in {404, 422}
+
+
+def test_match_image_url_keeps_gallery_identity_across_atomic_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    relative = Path("same") / "base.png"
+    first_payload = encode(np.full((32, 32, 3), 40, np.uint8))
+    second_payload = encode(np.full((32, 32, 3), 220, np.uint8))
+    for gallery, payload in ((first, first_payload), (second, second_payload)):
+        path = gallery / relative
+        path.parent.mkdir(parents=True)
+        path.write_bytes(payload)
+
+    settings = Settings(
+        gallery_dir=first,
+        cache_dir=tmp_path / "cache",
+        selection_file=tmp_path / "selection.json",
+    )
+    with TestClient(create_app(settings)) as client:
+        assert wait_until_ready(client)["state"] == "ready"
+        manager = client.app.state.gallery_manager
+        active = manager.snapshot().active
+        assert active is not None
+        match_started = Event()
+        match_released = Event()
+
+        def blocked_match(_query: np.ndarray, limit: int) -> list[MatchResult]:
+            assert limit == 3
+            match_started.set()
+            assert match_released.wait(timeout=5)
+            record = active.catalog.records[0]
+            return [MatchResult(record, 90.0, "phash", 0, 0.0, 0.9)]
+
+        monkeypatch.setattr(active.matcher, "match_many", blocked_match)
+        responses: list[Any] = []
+
+        def request_match() -> None:
+            responses.append(
+                client.post(
+                    "/api/match",
+                    files={
+                        "file": (
+                            "query.png",
+                            encode(np.zeros((8, 8, 3), np.uint8)),
+                            "image/png",
+                        )
+                    },
+                )
+            )
+
+        worker = Thread(target=request_match)
+        worker.start()
+        assert match_started.wait(timeout=5)
+        assert manager.reserve_switch(second) == "accepted"
+        manager.run_reserved_switch(second)
+        match_released.set()
+        worker.join(timeout=5)
+        assert not worker.is_alive()
+
+        response = responses[0]
+        assert response.status_code == 200
+        image_url = response.json()["matches"][0]["image_url"]
+        assert image_url.count("/") == 4
+        image_response = client.get(image_url)
+
+    assert image_response.status_code == 200
+    assert image_response.content == first_payload
+    assert image_response.content != second_payload
 
 
 def test_match_returns_three_ranked_distinct_results(
@@ -177,7 +249,7 @@ def test_image_delivery_returns_404_for_catalog_path_outside_gallery(tmp_path: P
         outside.write_bytes(record.path.read_bytes())
         catalog._by_id[record.image_id] = replace(record, path=outside)
 
-        response = client.get(f"/api/images/{record.image_id}")
+        response = client.get(f"/api/images/{active.cache_dir.name}/{record.image_id}")
 
     assert response.status_code == 404
     assert response.json()["error"]["code"] == "image_not_found"
@@ -638,6 +710,57 @@ const assert = (condition, message) => { if (!condition) throw new Error(message
 });
 """
 
+    subprocess.run(
+        ["node", "-e", harness, str(app_script)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_frontend_ignores_poll_started_before_accepted_gallery_reservation() -> None:
+    app_script = Path(__file__).parents[1] / "src" / "crop_matcher" / "static" / "app.js"
+    harness = r"""
+const fs = require("fs");
+const vm = require("vm");
+class Element {
+  constructor() { this.attrs = new Map(); this.dataset = {}; this.disabled = false; this.files = []; this.hidden = true; this.listeners = {}; this.textContent = ""; this.value = ""; }
+  addEventListener(name, callback) { this.listeners[name] = callback; }
+  append() {} click() {} contains() { return false; } focus() {}
+  getAttribute(name) { return this.attrs.has(name) ? this.attrs.get(name) : null; }
+  removeAttribute(name) { this.attrs.delete(name); } replaceChildren() {}
+  setAttribute(name, value) { this.attrs.set(name, String(value)); }
+}
+const selectors = ["#drop-zone", "#file-input", "#index-status", "#status-text", "#loading-status", "#error-message", "#upload-view", "#results-view", "#results-heading", "#query-summary", "#query-preview", "#query-name", "#query-meta", "#result-list", "#reupload-button", "#current-gallery-path", "#gallery-switch-form", "#gallery-path", "#switch-gallery-button", "#gallery-switch-status"];
+const elements = new Map(selectors.map((selector) => [selector, new Element()]));
+elements.get("#drop-zone").setAttribute("aria-disabled", "false");
+elements.get("#loading-status").hidden = true;
+let timerCallback = null;
+let resolveOldPoll;
+const responses = [
+  () => new Promise((resolve) => { resolveOldPoll = resolve; }),
+  async () => ({ ok: true, json: async () => ({ state: "ready", indexed_images: 1, gallery_dir: "C:\\old", pending_gallery_dir: "C:\\new", reindexing: true, switch_error: null }) }),
+];
+const context = {
+  console,
+  document: { createElement() { return new Element(); }, createTextNode(text) { return { textContent: text }; }, querySelector(selector) { return elements.get(selector); } },
+  fetch: (...args) => responses.shift()(...args), FormData: class { append() {} }, URL,
+  window: { addEventListener() {}, clearTimeout() { timerCallback = null; }, location: { origin: "http://testserver" }, setTimeout(callback) { timerCallback = callback; return 1; } },
+};
+vm.createContext(context); vm.runInContext(fs.readFileSync(process.argv[1], "utf8"), context);
+const flush = async () => { await new Promise((resolve) => setImmediate(resolve)); await new Promise((resolve) => setImmediate(resolve)); };
+const assert = (condition, message) => { if (!condition) throw new Error(message); };
+(async () => {
+  const oldPoll = context.pollStatus();
+  elements.get("#gallery-path").value = "C:\\new";
+  const submission = elements.get("#gallery-switch-form").listeners.submit({ preventDefault() {} });
+  await submission;
+  resolveOldPoll({ ok: true, json: async () => ({ state: "ready", indexed_images: 1, gallery_dir: "C:\\old", pending_gallery_dir: null, reindexing: false, switch_error: null }) });
+  await oldPoll; await flush();
+  assert(elements.get("#switch-gallery-button").disabled, "stale pre-reservation poll enabled switching");
+  assert(timerCallback !== null, "stale pre-reservation poll stopped accepted-switch polling");
+})().catch((error) => { console.error(error.stack || error); process.exitCode = 1; });
+"""
     subprocess.run(
         ["node", "-e", harness, str(app_script)],
         check=True,

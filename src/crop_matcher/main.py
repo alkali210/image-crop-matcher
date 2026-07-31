@@ -167,20 +167,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     width=result.record.width,
                     height=result.record.height,
                     similarity=result.similarity,
-                    image_url=f"/api/images/{result.record.image_id}",
+                    image_url=(f"/api/images/{active.cache_dir.name}/{result.record.image_id}"),
                 )
                 for result in results
             ],
         )
 
-    @app.get("/api/images/{image_id}")
-    async def get_image(image_id: str) -> FileResponse:
-        snapshot = manager.snapshot()
-        active = snapshot.active
-        if active is None:
-            raise ApiError(503, "service_unavailable", "The image index is not ready")
+    @app.get("/api/images/{gallery_id}/{image_id}")
+    async def get_image(gallery_id: str, image_id: str) -> FileResponse:
         try:
-            record = active.catalog.get(image_id)
+            catalog = manager.image_catalog(gallery_id)
+            record = catalog.get(image_id)
         except KeyError:
             raise ApiError(404, "image_not_found", "Image not found") from None
         return FileResponse(

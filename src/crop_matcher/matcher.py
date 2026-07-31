@@ -79,7 +79,9 @@ class ImageMatcher:
         target_count = min(limit, len(self.catalog.records))
         merged = {result.record.image_id: result for result in primary}
         if len(merged) < target_count:
-            for result in self._fallback_results(query_gray, set(merged)):
+            for result in self._fallback_results(
+                query_gray, set(merged), target_count - len(merged)
+            ):
                 merged.setdefault(result.record.image_id, result)
         return sorted(
             merged.values(),
@@ -305,7 +307,12 @@ class ImageMatcher:
     def _fallback(self, query_gray: np.ndarray) -> MatchResult:
         return self._fallback_results(query_gray, set())[0]
 
-    def _fallback_results(self, query_gray: np.ndarray, exclude_ids: set[str]) -> list[MatchResult]:
+    def _fallback_results(
+        self,
+        query_gray: np.ndarray,
+        exclude_ids: set[str],
+        requested_count: int = 0,
+    ) -> list[MatchResult]:
         if not self.catalog.records or not self.index.image_ids or not len(self.index.tiles.hashes):
             raise _NoMatchEvidenceError("Fallback index is empty")
 
@@ -318,7 +325,7 @@ class ImageMatcher:
         )
         order = np.argsort(distances, kind="stable")
         available_count = sum(image_id not in exclude_ids for image_id in self.index.image_ids)
-        target_count = min(max(1, self.settings.candidate_count), available_count)
+        target_count = min(max(1, self.settings.candidate_count, requested_count), available_count)
         candidate_indices: list[int] = []
         candidate_set: set[int] = set()
         for tile_index in order:
