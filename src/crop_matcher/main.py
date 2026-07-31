@@ -151,25 +151,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         started = time.perf_counter()
         try:
-            result = await asyncio.to_thread(active.matcher.match, query)
+            results = await asyncio.to_thread(active.matcher.match_many, query, limit=3)
         except Exception:
             logger.exception("Image matching failed")
             raise ApiError(500, "internal_error", "An internal error occurred") from None
         elapsed_ms = round((time.perf_counter() - started) * 1000)
-        record = result.record
         return MatchResponse(
             query=QueryInfo(width=query.shape[1], height=query.shape[0]),
             elapsed_ms=elapsed_ms,
             matches=[
                 MatchItem(
-                    image_id=record.image_id,
-                    parent_name=record.parent_name,
-                    filename=record.filename,
-                    width=record.width,
-                    height=record.height,
+                    image_id=result.record.image_id,
+                    parent_name=result.record.parent_name,
+                    filename=result.record.filename,
+                    width=result.record.width,
+                    height=result.record.height,
                     similarity=result.similarity,
-                    image_url=f"/api/images/{record.image_id}",
+                    image_url=f"/api/images/{result.record.image_id}",
                 )
+                for result in results
             ],
         )
 

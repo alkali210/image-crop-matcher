@@ -16,6 +16,7 @@ from starlette.datastructures import UploadFile
 
 from crop_matcher.config import Settings
 from crop_matcher.main import create_app
+from crop_matcher.matcher import MatchResult
 from crop_matcher.schemas import MatchItem
 
 
@@ -127,6 +128,42 @@ def test_status_match_and_safe_image_delivery(tmp_path: Path) -> None:
             "error": {"code": "image_not_found", "message": "Image not found"}
         }
         assert client.get("/api/images/../../outside").status_code in {404, 422}
+
+
+def test_match_returns_three_ranked_distinct_results(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gallery = tmp_path / "songs"
+    for seed in range(3):
+        image = np.full((32, 32, 3), seed * 50, np.uint8)
+        path = gallery / f"song-{seed}" / "base.png"
+        path.parent.mkdir(parents=True)
+        path.write_bytes(encode(image))
+    settings = Settings(gallery_dir=gallery, cache_dir=tmp_path / "cache")
+
+    with TestClient(create_app(settings)) as client:
+        assert wait_until_ready(client)["state"] == "ready"
+        active = client.app.state.gallery_manager.snapshot().active
+        assert active is not None
+        by_parent = {record.parent_name: record for record in active.catalog.records}
+        ranked = [
+            MatchResult(by_parent["song-2"], 90.0, "sift", 4, 1.0, 0.9),
+            MatchResult(by_parent["song-0"], 80.0, "phash", 0, 0.0, 0.8),
+            MatchResult(by_parent["song-1"], 70.0, "phash", 0, 0.0, 0.7),
+        ]
+        monkeypatch.setattr(active.matcher, "match_many", lambda _query, limit: ranked[:limit])
+
+        response = client.post(
+            "/api/match",
+            files={"file": ("query.png", encode(np.zeros((8, 8, 3), np.uint8)), "image/png")},
+        )
+
+    assert response.status_code == 200
+    matches = response.json()["matches"]
+    assert len(matches) == 3
+    assert [match["parent_name"] for match in matches] == ["song-2", "song-0", "song-1"]
+    assert len({match["image_id"] for match in matches}) == 3
+    assert [match["similarity"] for match in matches] == [90.0, 80.0, 70.0]
 
 
 def test_image_delivery_returns_404_for_catalog_path_outside_gallery(tmp_path: Path) -> None:
@@ -253,7 +290,7 @@ def test_matching_runs_in_a_worker_thread(tmp_path: Path, monkeypatch: pytest.Mo
         )
 
     assert response.status_code == 200
-    assert calls == [matcher.match]
+    assert calls == [matcher.match_many]
 
 
 def test_build_failure_and_unavailable_match_are_structured(tmp_path: Path) -> None:
@@ -392,10 +429,11 @@ def test_internal_match_error_is_generic_and_does_not_leak_paths(
         assert active is not None
         matcher = active.matcher
 
-        def fail_match(_query: np.ndarray) -> None:
+        def fail_match(_query: np.ndarray, limit: int) -> None:
+            assert limit == 3
             raise RuntimeError(r"failed at D:\private\songs\secret.jpg")
 
-        monkeypatch.setattr(matcher, "match", fail_match)
+        monkeypatch.setattr(matcher, "match_many", fail_match)
         response = client.post(
             "/api/match",
             files={"file": ("query.png", encode(np.zeros((8, 8, 3), np.uint8)), "image/png")},

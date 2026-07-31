@@ -55,55 +55,76 @@ class ImageMatcher:
         )
 
     def match(self, query_bgr: np.ndarray) -> MatchResult:
+        return self.match_many(query_bgr, limit=1)[0]
+
+    def match_many(self, query_bgr: np.ndarray, limit: int = 3) -> list[MatchResult]:
+        if limit < 1:
+            raise ValueError("limit must be positive")
+
         query_gray = to_gray(query_bgr)
         feature_query, extraction_scale = self._feature_query(query_gray)
         with self._sift_lock:
             keypoints, descriptors = self._sift.detectAndCompute(feature_query, None)
         points = np.asarray([point.pt for point in keypoints], dtype=np.float32).reshape(-1, 2)
-        if descriptors is None or len(descriptors) < 4:
-            return self._fallback(query_gray)
+        primary = (
+            self._primary_results(
+                query_gray,
+                points,
+                descriptors,
+                extraction_scale,
+            )
+            if descriptors is not None and len(descriptors) >= 4
+            else []
+        )
+        target_count = min(limit, len(self.catalog.records))
+        merged = {result.record.image_id: result for result in primary}
+        if len(merged) < target_count:
+            for result in self._fallback_results(query_gray, set(merged)):
+                merged.setdefault(result.record.image_id, result)
+        return sorted(
+            merged.values(),
+            key=lambda result: (-result.similarity, result.record.image_id),
+        )[:target_count]
 
-        candidate_ids = self._retrieve(descriptors)
+    def _primary_results(
+        self,
+        query_gray: np.ndarray,
+        query_points: np.ndarray,
+        query_descriptors: np.ndarray,
+        extraction_scale: float,
+    ) -> list[MatchResult]:
         candidates = [
             score
-            for image_id in candidate_ids
+            for image_id in self._retrieve(query_descriptors)
             if (
                 score := self._verify(
                     image_id,
                     query_gray,
-                    points,
-                    descriptors,
+                    query_points,
+                    query_descriptors,
                     extraction_scale,
                 )
             )
             is not None
         ]
+        candidates.sort(key=lambda item: (-item.raw_score, item.record.image_id))
         if not candidates:
-            return self._fallback(query_gray)
+            return []
 
-        candidates.sort(key=lambda item: item.raw_score, reverse=True)
-        best = candidates[0]
         second = candidates[1].raw_score if len(candidates) > 1 else 0.0
-        margin = float(np.clip((best.raw_score - second) / 0.2, 0.0, 1.0))
-        similarity = round(
-            100.0
-            * float(
-                np.clip(
-                    0.4 * best.geometry + 0.5 * best.appearance + 0.1 * margin,
-                    0.0,
-                    1.0,
-                )
-            ),
-            1,
-        )
-        return MatchResult(
-            best.record,
-            similarity,
-            "sift",
-            best.inlier_count,
-            best.inlier_ratio,
-            best.appearance,
-        )
+        margin = float(np.clip((candidates[0].raw_score - second) / 0.2, 0.0, 1.0))
+        results = [
+            MatchResult(
+                candidate.record,
+                round(100.0 * float(np.clip(candidate.raw_score + 0.1 * margin, 0.0, 1.0)), 1),
+                "sift",
+                candidate.inlier_count,
+                candidate.inlier_ratio,
+                candidate.appearance,
+            )
+            for candidate in candidates
+        ]
+        return sorted(results, key=lambda result: (-result.similarity, result.record.image_id))
 
     def _feature_query(self, query_gray: np.ndarray) -> tuple[np.ndarray, float]:
         height, width = query_gray.shape[:2]
@@ -282,6 +303,9 @@ class ImageMatcher:
         return float(np.clip((normalized_correlation(left, right) + 1.0) / 2.0, 0.0, 1.0))
 
     def _fallback(self, query_gray: np.ndarray) -> MatchResult:
+        return self._fallback_results(query_gray, set())[0]
+
+    def _fallback_results(self, query_gray: np.ndarray, exclude_ids: set[str]) -> list[MatchResult]:
         if not self.catalog.records or not self.index.image_ids or not len(self.index.tiles.hashes):
             raise _NoMatchEvidenceError("Fallback index is empty")
 
@@ -293,12 +317,17 @@ class ImageMatcher:
             count=len(xor),
         )
         order = np.argsort(distances, kind="stable")
-        target_count = min(max(1, self.settings.candidate_count), len(self.index.image_ids))
+        available_count = sum(image_id not in exclude_ids for image_id in self.index.image_ids)
+        target_count = min(max(1, self.settings.candidate_count), available_count)
         candidate_indices: list[int] = []
         candidate_set: set[int] = set()
         for tile_index in order:
             image_index = int(self.index.tiles.image_indices[tile_index])
-            if not 0 <= image_index < len(self.index.image_ids) or image_index in candidate_set:
+            if (
+                not 0 <= image_index < len(self.index.image_ids)
+                or self.index.image_ids[image_index] in exclude_ids
+                or image_index in candidate_set
+            ):
                 continue
             candidate_indices.append(image_index)
             candidate_set.add(image_index)
@@ -309,21 +338,32 @@ class ImageMatcher:
                 image_index
                 for image_index in range(len(self.index.image_ids))
                 if image_index not in candidate_set
+                and self.index.image_ids[image_index] not in exclude_ids
             )
             candidate_indices = candidate_indices[:target_count]
 
         scored = [self._template_score(index, query_gray) for index in candidate_indices]
         ranking = sorted(
             zip(candidate_indices, scored, strict=True),
-            key=lambda item: item[1],
-            reverse=True,
+            key=lambda item: (-item[1], self.index.image_ids[item[0]]),
         )
-        best_index, best_score = ranking[0]
+        if not ranking:
+            return []
+        _, best_score = ranking[0]
         second_score = ranking[1][1] if len(ranking) > 1 else 0.0
         margin = float(np.clip((best_score - second_score) / 0.2, 0.0, 1.0))
-        similarity = round(min(89.9, 100.0 * (0.85 * best_score + 0.15 * margin)), 1)
-        record = self.catalog.get(self.index.image_ids[best_index])
-        return MatchResult(record, similarity, "phash", 0, 0.0, best_score)
+        results = [
+            MatchResult(
+                self.catalog.get(self.index.image_ids[image_index]),
+                round(min(89.9, 100.0 * (0.85 * score + 0.15 * margin)), 1),
+                "phash",
+                0,
+                0.0,
+                score,
+            )
+            for image_index, score in ranking
+        ]
+        return sorted(results, key=lambda result: (-result.similarity, result.record.image_id))
 
     def _template_score(self, image_index: int, query_gray: np.ndarray) -> float:
         query_height, query_width = query_gray.shape[:2]

@@ -13,7 +13,7 @@ from crop_matcher import matcher as matcher_module
 from crop_matcher.catalog import ImageCatalog, ImageRecord
 from crop_matcher.config import Settings
 from crop_matcher.feature_index import FeatureIndex, ImageFeatures, TileFeatures
-from crop_matcher.matcher import CandidateScore, ImageMatcher
+from crop_matcher.matcher import CandidateScore, ImageMatcher, MatchResult
 
 
 def make_art(seed: int) -> np.ndarray:
@@ -47,6 +47,11 @@ def write_png(path: Path, image: np.ndarray) -> None:
     ok, payload = cv2.imencode(".png", image)
     assert ok
     path.write_bytes(payload.tobytes())
+
+
+def record(image_id: str) -> ImageRecord:
+    path = Path(f"{image_id}.png")
+    return ImageRecord(image_id, path, path, "", path.name, 1, 1)
 
 
 class FakeGlobalMatcher:
@@ -180,12 +185,12 @@ def test_fallback_skips_invalid_and_duplicate_tile_owners(
 
     monkeypatch.setattr(matcher, "_template_score", template_score, raising=False)
 
-    result = matcher._fallback(np.zeros((64, 64), np.uint8))
+    results = matcher._fallback_results(np.zeros((64, 64), np.uint8), set())
 
     assert scored_indices == [0, 1]
-    assert result.record.image_id == "second"
-    assert result.method == "phash"
-    assert result.similarity <= 89.9
+    assert [result.record.image_id for result in results] == ["second", "first"]
+    assert [result.similarity for result in results] == [89.9, 57.5]
+    assert all(result.method == "phash" for result in results)
 
 
 def test_template_score_uses_only_bounded_candidate_levels(
@@ -400,6 +405,7 @@ def test_match_ranks_by_raw_score_and_applies_bounded_margin(
         "second": CandidateScore(second_record, 0.5, 0.5, 0.44, 8, 0.8),
     }
     matcher = ImageMatcher.__new__(ImageMatcher)
+    matcher.catalog = ImageCatalog(Path(), (best_record, second_record), ())
     matcher._sift = SimpleNamespace(
         detectAndCompute=lambda *_args: (
             [SimpleNamespace(pt=(float(index), float(index))) for index in range(4)],
@@ -411,11 +417,86 @@ def test_match_ranks_by_raw_score_and_applies_bounded_margin(
     monkeypatch.setattr(matcher, "_retrieve", lambda _descriptors: ["second", "best"])
     monkeypatch.setattr(matcher, "_verify", lambda image_id, *_args: scores[image_id])
 
+    results = matcher.match_many(np.zeros((8, 8), np.uint8), limit=2)
     result = matcher.match(np.zeros((8, 8), np.uint8))
 
     assert result.record == best_record
     assert result.similarity == pytest.approx(45.5)
     assert 0.0 <= result.similarity <= 100.0
+    assert [item.similarity for item in results] == pytest.approx([45.5, 44.5])
+
+
+def test_match_many_merges_distinct_results_in_deterministic_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    records = tuple(record(image_id) for image_id in ("b", "a", "c", "d"))
+    matcher = ImageMatcher.__new__(ImageMatcher)
+    matcher.catalog = ImageCatalog(Path(), records, ())
+    matcher._sift = SimpleNamespace(
+        detectAndCompute=lambda *_args: (
+            [SimpleNamespace(pt=(float(index), float(index))) for index in range(4)],
+            np.zeros((4, 128), np.float32),
+        )
+    )
+    matcher._sift_lock = Lock()
+    monkeypatch.setattr(matcher, "_feature_query", lambda query: (query, 1.0))
+    primary = [
+        MatchResult(records[0], 80.0, "sift", 4, 1.0, 0.8),
+        MatchResult(records[1], 80.0, "sift", 4, 1.0, 0.8),
+    ]
+
+    def fallback(_query: np.ndarray, exclude_ids: set[str]) -> list[MatchResult]:
+        assert exclude_ids == {"a", "b"}
+        return [
+            MatchResult(records[0], 99.0, "phash", 0, 0.0, 0.9),
+            MatchResult(records[2], 90.0, "phash", 0, 0.0, 0.9),
+            MatchResult(records[3], 70.0, "phash", 0, 0.0, 0.7),
+        ]
+
+    monkeypatch.setattr(matcher, "_primary_results", lambda *_args: primary, raising=False)
+    monkeypatch.setattr(matcher, "_fallback_results", fallback, raising=False)
+
+    results = matcher.match_many(np.zeros((8, 8), np.uint8), limit=3)
+
+    assert [result.record.image_id for result in results] == ["c", "a", "b"]
+    assert len({result.record.image_id for result in results}) == 3
+    assert [result.similarity for result in results] == [90.0, 80.0, 80.0]
+
+
+def test_match_many_returns_all_results_when_gallery_has_fewer_than_limit(tmp_path: Path) -> None:
+    gallery = tmp_path / "songs"
+    sources = [make_art(seed) for seed in range(2)]
+    for seed, image in enumerate(sources):
+        write_png(gallery / f"song-{seed}" / "base.png", image)
+    settings = Settings(gallery_dir=gallery, cache_dir=tmp_path / "cache")
+    catalog = ImageCatalog.scan(gallery, settings.max_image_pixels)
+    matcher = ImageMatcher(catalog, FeatureIndex.load_or_build(catalog, settings), settings)
+
+    results = matcher.match_many(sources[0][80:240, 80:240], limit=3)
+
+    assert len(results) == 2
+    assert len({result.record.image_id for result in results}) == 2
+
+
+def test_match_remains_first_match_many_result(tmp_path: Path) -> None:
+    gallery = tmp_path / "songs"
+    sources = [make_art(seed) for seed in range(3)]
+    for seed, image in enumerate(sources):
+        write_png(gallery / f"song-{seed}" / "base.png", image)
+    settings = Settings(gallery_dir=gallery, cache_dir=tmp_path / "cache")
+    catalog = ImageCatalog.scan(gallery, settings.max_image_pixels)
+    matcher = ImageMatcher(catalog, FeatureIndex.load_or_build(catalog, settings), settings)
+    query = sources[1][80:240, 80:240]
+
+    assert matcher.match(query) == matcher.match_many(query, limit=1)[0]
+
+
+@pytest.mark.parametrize("limit", [0, -1])
+def test_match_many_requires_positive_limit(limit: int) -> None:
+    matcher = ImageMatcher.__new__(ImageMatcher)
+
+    with pytest.raises(ValueError, match="limit must be positive"):
+        matcher.match_many(np.zeros((8, 8), np.uint8), limit=limit)
 
 
 def test_simultaneous_matches_serialize_shared_sift(
@@ -439,18 +520,17 @@ def test_simultaneous_matches_serialize_shared_sift(
     matcher = ImageMatcher(ImageCatalog(Path(), (), ()), SimpleNamespace(), Settings())
     sift = OverlapDetectingSift()
     matcher._sift = sift
-    expected = object()
-    monkeypatch.setattr(matcher, "_fallback", lambda _query: expected)
+    monkeypatch.setattr(matcher, "_fallback_results", lambda _query, _exclude: [])
     barrier = Barrier(2)
 
     def run_match() -> object:
         barrier.wait()
-        return matcher.match(np.zeros((8, 8), np.uint8))
+        return matcher.match_many(np.zeros((8, 8), np.uint8))
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         results = list(executor.map(lambda _index: run_match(), range(2)))
 
-    assert results == [expected, expected]
+    assert results == [[], []]
     assert sift.maximum_active == 1
 
 
