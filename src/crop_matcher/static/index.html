@@ -27,6 +27,30 @@
           <span id="status-text">正在读取索引状态...</span>
         </div>
 
+        <section class="gallery-selector" aria-labelledby="gallery-selector-heading">
+          <div class="gallery-current">
+            <h2 id="gallery-selector-heading">当前图库</h2>
+            <output id="current-gallery-path">正在读取...</output>
+          </div>
+          <form id="gallery-switch-form" class="gallery-switch-form">
+            <label for="gallery-path">切换到绝对路径</label>
+            <div class="gallery-switch-fields">
+              <input
+                id="gallery-path"
+                name="gallery-path"
+                type="text"
+                autocomplete="off"
+                spellcheck="false"
+                placeholder="C:\path\to\gallery"
+                aria-describedby="gallery-path-help gallery-switch-status"
+              >
+              <button id="switch-gallery-button" class="secondary-button" type="submit">切换图库</button>
+            </div>
+            <p id="gallery-path-help" class="gallery-path-help">输入包含原图的本机文件夹绝对路径</p>
+            <p id="gallery-switch-status" class="gallery-switch-status" role="status" aria-live="polite"></p>
+          </form>
+        </section>
+
         <div class="upload-panel">
           <div
             id="drop-zone"

@@ -170,6 +170,92 @@ main {
   background: var(--error);
 }
 
+.gallery-selector {
+  margin-bottom: 16px;
+  padding: 14px 16px 15px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+}
+
+.gallery-current {
+  display: grid;
+  margin-bottom: 12px;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 12px;
+  align-items: baseline;
+}
+
+.gallery-current h2,
+.gallery-current output,
+.gallery-switch-form label,
+.gallery-path-help,
+.gallery-switch-status {
+  margin: 0;
+}
+
+.gallery-current h2,
+.gallery-switch-form label {
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+}
+
+.gallery-current output {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-size: 0.82rem;
+  text-align: right;
+}
+
+.gallery-switch-form label {
+  display: block;
+  margin-bottom: 5px;
+}
+
+.gallery-switch-fields {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+}
+
+.gallery-switch-fields input {
+  width: 100%;
+  min-width: 0;
+  min-height: 44px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 0;
+  background: var(--charcoal);
+  color: var(--warm-white);
+}
+
+.gallery-switch-fields input::placeholder {
+  color: var(--muted);
+  opacity: 0.72;
+}
+
+.gallery-switch-fields .secondary-button {
+  white-space: nowrap;
+}
+
+.gallery-path-help,
+.gallery-switch-status {
+  min-height: 18px;
+  margin-top: 5px;
+  color: var(--muted);
+  font-size: 0.72rem;
+  overflow-wrap: anywhere;
+}
+
+.gallery-switch-status[data-state="error"] {
+  color: var(--error);
+}
+
+.gallery-switch-status[data-state="pending"] {
+  color: var(--green);
+}
+
 .upload-panel {
   border: 1px solid var(--line);
   background: var(--surface);
@@ -504,6 +590,23 @@ main {
   .drop-zone {
     min-height: 290px;
     padding: 38px 20px 30px;
+  }
+
+  .gallery-current {
+    grid-template-columns: 1fr;
+    gap: 2px;
+  }
+
+  .gallery-current output {
+    text-align: left;
+  }
+
+  .gallery-switch-fields {
+    grid-template-columns: 1fr;
+  }
+
+  .gallery-switch-fields .secondary-button {
+    width: 100%;
   }
 
   .results-toolbar {

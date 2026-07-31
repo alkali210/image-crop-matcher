@@ -34,23 +34,33 @@ On macOS or Linux, the Python commands are unchanged; activate with
 
 ## Gallery And Startup
 
-Place source images anywhere below `songs/`. The recursive scan supports `.jpg`, `.jpeg`, `.png`,
-`.webp`, and `.bmp` files, case-insensitively. Files whose stem ends in `_256` are treated as
-generated thumbnails and excluded.
+Place source images anywhere below `songs/`, or enter another existing **absolute directory path**
+in the web interface. The recursive scan supports `.jpg`, `.jpeg`, `.png`, `.webp`, and `.bmp`
+files, case-insensitively. Files whose stem ends in `_256` are treated as generated thumbnails and
+excluded.
 
-The first startup scans and decodes the gallery, then stores catalog metadata in
-`.cache/catalog.json` and SIFT/perceptual-hash arrays in `.cache/features.npz`. Later startups only
-compare file paths, sizes, and modification times before restoring the cached dimensions and feature
-arrays; source image contents are not read again while the gallery is unchanged. The in-memory FLANN
-search tree is still rebuilt from the cached descriptors. `GET /api/status` reports `building`,
-`ready`, or `error` and includes the indexed image count and build time.
+The first use of a gallery scans and decodes it, then stores catalog metadata and
+SIFT/perceptual-hash arrays in a per-gallery namespace below `.cache/galleries/`. The namespace is
+derived from the gallery's resolved absolute path, so two galleries never overwrite each other's
+cache. Later uses compare file paths, sizes, and modification times before restoring cached
+dimensions and feature arrays; source image contents are not read again while that gallery is
+unchanged. The in-memory FLANN search tree is still rebuilt from the cached descriptors.
+`GET /api/status` reports `building`, `ready`, or `error`, the indexed image count and build time,
+and active/pending gallery paths.
 
 After upgrading from an older cache schema, the next startup performs one full rebuild. Subsequent
 starts use the new catalog and feature caches normally.
 
-The application does not watch the gallery. Restart Uvicorn after adding, replacing, moving, or
-removing an image. A gallery manifest change invalidates the complete feature cache, which is then
-rebuilt during startup.
+After a successful runtime switch, the selected absolute path is saved in `.crop-matcher.json` and
+used on the next startup. This local state file is ignored by Git and is not written when indexing
+the replacement fails. A switch builds in the background: the previous gallery remains available
+for uploads, searches, and original-image links until the replacement is complete, then the active
+bundle is swapped atomically. A failed build rolls back to the previous gallery and displays an
+error beside the path control.
+
+The application does not watch an active gallery for file changes. To rebuild after adding,
+replacing, moving, or removing images, restart Uvicorn or switch away and back. A manifest change
+invalidates that gallery's feature cache.
 
 ## Queries And Results
 
@@ -63,20 +73,24 @@ Uploads may use any of the five supported image formats regardless of filename o
 type; successful OpenCV decoding determines validity. Each upload is limited to 10 MiB and its
 decoded dimensions are limited to 25 megapixels.
 
-The service returns the highest-ranked source because a valid query is expected to come from the
-gallery. It does not use a rejection threshold. `similarity` is a bounded 0-100 ranking-confidence
-score, not a probability. Perceptual-hash fallback scores are capped at 89.9 to indicate weaker
-geometric evidence. Identical source regions and nearly featureless crops are inherently ambiguous,
-so the guaranteed best result may not be the intended source in those cases.
+The service returns up to three distinct sources in descending rank because a valid query is
+expected to come from the gallery. Smaller galleries return fewer results. It does not use a
+rejection threshold. `similarity` is a bounded 0-100 ranking-confidence score, not a probability.
+Perceptual-hash fallback scores are capped at 89.9 to indicate weaker geometric evidence. Identical
+source regions and nearly featureless crops are inherently ambiguous, so the highest-ranked result
+may not be the intended source in those cases.
 
 ## API
 
-The application exposes three API routes:
+The application exposes four API routes:
 
-- `GET /api/status` returns startup state, indexed image count, build time, and any public startup
-  error.
+- `GET /api/status` returns startup state, indexed image count, build time, active and pending paths,
+  reindexing state, and any public startup or switch error.
+- `POST /api/gallery` accepts JSON such as `{"path":"C:\\images\\gallery"}`. The path must be
+  absolute. It returns `202` while a replacement builds, `200` when that gallery is already active,
+  `400` for an invalid path, or `409` when another startup/build switch is in progress.
 - `POST /api/match` accepts one multipart field named `file` and returns query dimensions, elapsed
-  time, and exactly one current best match in `matches`.
+  time, and up to three ranked entries in `matches`.
 - `GET /api/images/{image_id}` returns the trusted original gallery file for an ID returned by the
   matcher. Unknown IDs return `404`.
 
@@ -86,8 +100,9 @@ Example PowerShell request:
 curl.exe -F "file=@C:\path\to\crop.png" http://127.0.0.1:8000/api/match
 ```
 
-While startup is still building, match and image requests return `503`. Invalid images return
-`400`; oversized files or decoded images return `413`. API errors use
+While the initial startup is still building, match and image requests return `503`. During a runtime
+replacement build they continue using the active gallery. Invalid images return `400`; oversized
+files or decoded images return `413`. Concurrent gallery switch requests return `409`. API errors use
 `{"error":{"code":"...","message":"..."}}`.
 
 ## Benchmark

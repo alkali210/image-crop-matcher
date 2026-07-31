@@ -474,6 +474,32 @@ def test_root_serves_functional_static_shell(tmp_path: Path) -> None:
         assert client.get("/static/app.js").status_code == 200
 
 
+def test_webui_contains_runtime_gallery_controls(tmp_path: Path) -> None:
+    with make_client(tmp_path) as client:
+        html = client.get("/").text
+
+    assert '<label for="gallery-path">' in html
+    assert 'id="gallery-path"' in html
+    assert 'autocomplete="off"' in html
+    assert 'id="current-gallery-path"' in html
+    assert 'id="switch-gallery-button"' in html
+    assert 'id="gallery-switch-status"' in html
+    assert 'aria-live="polite"' in html
+
+
+def test_frontend_submits_gallery_path_and_keeps_upload_during_reindex(tmp_path: Path) -> None:
+    with make_client(tmp_path) as client:
+        script = client.get("/static/app.js").text
+
+    assert 'fetch("/api/gallery"' in script
+    assert "pending_gallery_dir" in script
+    assert "reindexing" in script
+    assert "galleryPending" in script
+    assert "switchGalleryButton.disabled = pending" in script
+    assert "status.gallery_dir" in script
+    assert "status.switch_error" in script
+
+
 def test_upload_shell_lists_exact_supported_formats_and_limits(tmp_path: Path) -> None:
     with make_client(tmp_path) as client:
         response = client.get("/")
@@ -531,6 +557,8 @@ const selectors = [
   "#drop-zone", "#file-input", "#index-status", "#status-text", "#loading-status",
   "#error-message", "#upload-view", "#results-view", "#results-heading", "#query-summary",
   "#query-preview", "#query-name", "#query-meta", "#result-list", "#reupload-button",
+  "#current-gallery-path", "#gallery-switch-form", "#gallery-path",
+  "#switch-gallery-button", "#gallery-switch-status",
 ];
 const elements = new Map(selectors.map((selector) => [selector, new Element()]));
 elements.get("#drop-zone").setAttribute("aria-disabled", "false");

@@ -9,6 +9,9 @@ const state = {
   queryUrl: null,
   statusTimer: null,
   statusPending: false,
+  galleryPending: false,
+  gallerySubmitting: false,
+  hasActiveGallery: false,
 };
 
 const dropZone = document.querySelector("#drop-zone");
@@ -26,6 +29,11 @@ const queryName = document.querySelector("#query-name");
 const queryMeta = document.querySelector("#query-meta");
 const resultList = document.querySelector("#result-list");
 const reuploadButton = document.querySelector("#reupload-button");
+const currentGalleryPath = document.querySelector("#current-gallery-path");
+const gallerySwitchForm = document.querySelector("#gallery-switch-form");
+const galleryPath = document.querySelector("#gallery-path");
+const switchGalleryButton = document.querySelector("#switch-gallery-button");
+const gallerySwitchStatus = document.querySelector("#gallery-switch-status");
 
 function setUploadEnabled(enabled) {
   const canUpload = enabled && loadingStatus.hidden;
@@ -35,6 +43,7 @@ function setUploadEnabled(enabled) {
 
 function renderStatus(status) {
   const count = Number.isFinite(status.indexed_images) ? status.indexed_images : 0;
+  state.hasActiveGallery = typeof status.gallery_dir === "string" && status.gallery_dir.length > 0;
   indexStatus.dataset.state = status.state;
 
   if (status.state === "ready") {
@@ -51,6 +60,43 @@ function renderStatus(status) {
 
   const detail = typeof status.error === "string" && status.error ? `：${status.error}` : "";
   statusText.textContent = `图片索引不可用${detail}`;
+}
+
+function setGalleryPending(pending) {
+  state.galleryPending = pending;
+  switchGalleryButton.disabled = pending;
+}
+
+function setGallerySwitchMessage(message, statusState = "") {
+  gallerySwitchStatus.textContent = message;
+  if (statusState) {
+    gallerySwitchStatus.dataset.state = statusState;
+  } else {
+    delete gallerySwitchStatus.dataset.state;
+  }
+}
+
+function renderGalleryStatus(status) {
+  const activePath = typeof status.gallery_dir === "string" ? status.gallery_dir : "";
+  const pendingPath =
+    typeof status.pending_gallery_dir === "string" ? status.pending_gallery_dir : "";
+  const wasPending = state.galleryPending;
+  currentGalleryPath.textContent = activePath || "尚无可用图库";
+
+  if (status.reindexing && pendingPath) {
+    setGalleryPending(true);
+    setGallerySwitchMessage(`正在建立新图库索引：${pendingPath}`, "pending");
+    return;
+  }
+
+  if (!state.gallerySubmitting) {
+    setGalleryPending(false);
+  }
+  if (typeof status.switch_error === "string" && status.switch_error) {
+    setGallerySwitchMessage(`图库切换失败：${status.switch_error}。当前图库仍可使用。`, "error");
+  } else if (wasPending) {
+    setGallerySwitchMessage("图库已切换", "");
+  }
 }
 
 function clearStatusTimer() {
@@ -71,7 +117,7 @@ function scheduleStatusPoll() {
 function renderStatusUnavailable() {
   indexStatus.dataset.state = "error";
   statusText.textContent = STATUS_RETRY_MESSAGE;
-  setUploadEnabled(false);
+  setUploadEnabled(state.hasActiveGallery);
 }
 
 async function pollStatus() {
@@ -89,7 +135,8 @@ async function pollStatus() {
     }
     const status = await response.json();
     renderStatus(status);
-    if (status.state === "building") {
+    renderGalleryStatus(status);
+    if (status.state === "building" || status.reindexing) {
       scheduleStatusPoll();
     }
   } catch (_error) {
@@ -103,7 +150,7 @@ async function pollStatus() {
 function setBusy(busy) {
   loadingStatus.hidden = !busy;
   reuploadButton.disabled = busy;
-  setUploadEnabled(!busy && indexStatus.dataset.state === "ready");
+  setUploadEnabled(!busy && state.hasActiveGallery);
 }
 
 function clearError() {
@@ -280,6 +327,50 @@ async function parseJsonResponse(response) {
   }
 }
 
+async function submitGallery(event) {
+  event.preventDefault();
+  const path = galleryPath.value.trim();
+  if (!path) {
+    setGallerySwitchMessage("请输入图库的绝对路径", "error");
+    galleryPath.focus();
+    return;
+  }
+
+  state.gallerySubmitting = true;
+  setGalleryPending(true);
+  setGallerySwitchMessage(`正在请求切换：${path}`, "pending");
+  let remainsPending = false;
+
+  try {
+    const response = await fetch("/api/gallery", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path }),
+    });
+    const status = await parseJsonResponse(response);
+    if (!response.ok) {
+      const apiMessage = status?.error?.message;
+      throw new Error(
+        typeof apiMessage === "string" && apiMessage.trim() ? apiMessage : "无法切换图库",
+      );
+    }
+    renderStatus(status);
+    renderGalleryStatus(status);
+    remainsPending = status.reindexing === true;
+    if (remainsPending) {
+      scheduleStatusPoll();
+    } else {
+      setGallerySwitchMessage("当前图库已就绪", "");
+    }
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : "无法切换图库";
+    setGallerySwitchMessage(`图库切换失败：${detail}。当前图库仍可使用。`, "error");
+  } finally {
+    state.gallerySubmitting = false;
+    setGalleryPending(remainsPending);
+  }
+}
+
 async function submitFile(file) {
   if (!file || dropZone.getAttribute("aria-disabled") === "true") {
     return;
@@ -342,9 +433,8 @@ function restorePage() {
     queryPreview.src = state.queryUrl;
   }
 
-  const isReady = indexStatus.dataset.state === "ready";
-  setUploadEnabled(isReady);
-  if (!isReady && state.statusTimer === null && !state.statusPending) {
+  setUploadEnabled(state.hasActiveGallery);
+  if (state.statusTimer === null && !state.statusPending) {
     pollStatus();
   }
 }
@@ -385,6 +475,7 @@ fileInput.addEventListener("change", () => {
 });
 
 reuploadButton.addEventListener("click", resetUpload);
+gallerySwitchForm.addEventListener("submit", submitGallery);
 window.addEventListener("pagehide", (event) => {
   if (event.persisted) {
     return;
