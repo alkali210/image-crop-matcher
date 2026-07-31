@@ -1,3 +1,5 @@
+from hashlib import sha256
+import os
 from pathlib import Path
 
 import pytest
@@ -19,6 +21,9 @@ def test_gallery_cache_namespaces_are_stable_and_distinct(tmp_path: Path) -> Non
     second = tmp_path / "second"
     first.mkdir()
     second.mkdir()
+    normalized = os.path.normcase(str(first.resolve()))
+    expected = tmp_path / ".cache" / "galleries" / sha256(normalized.encode("utf-8")).hexdigest()
+    assert gallery_cache_dir(tmp_path / ".cache", first) == expected
     assert gallery_cache_dir(tmp_path / ".cache", first) == gallery_cache_dir(
         tmp_path / ".cache", first
     )
