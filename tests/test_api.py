@@ -885,7 +885,8 @@ const elements = new Map(selectors.map((selector) => [selector, new Element()]))
 elements.get("#loading-status").hidden = true; elements.get("#gallery-path").value = "C:\\new";
 let timerCallback = null;
 const responses = [
-  async () => ({ ok: true, json: async () => ({ reindexing: false }) }),
+  async () => ({ ok: true, json: async () => ({ state: "ready", indexed_images: 0, build_time_ms: 4, error: null, gallery_dir: "C:\\new", pending_gallery_dir: null, reindexing: false, switch_error: null }) }),
+  async () => ({ ok: true, json: async () => ({ state: "error", indexed_images: 0, build_time_ms: null, error: "   ", gallery_dir: null, pending_gallery_dir: null, reindexing: false, switch_error: null }) }),
   async () => ({ ok: true, json: async () => ({ state: "ready", indexed_images: 2, build_time_ms: 4, error: null, gallery_dir: "C:\\new", pending_gallery_dir: null, reindexing: false, switch_error: null }) }),
   async () => ({ ok: true, json: async () => ({ reindexing: false }) }),
 ];
@@ -905,6 +906,10 @@ const assert = (condition, message) => { if (!condition) throw new Error(message
   assert(timerCallback !== null, "incomplete POST status did not schedule reconciliation");
   assert(!elements.get("#file-input").disabled, "incomplete POST status disabled known active upload");
   let poll = timerCallback; poll(); await new Promise((resolve) => setImmediate(resolve));
+  assert(elements.get("#switch-gallery-button").disabled, "invalid error status cleared ambiguous submission lock");
+  assert(!elements.get("#file-input").disabled, "invalid error status replaced known active availability");
+  assert(timerCallback !== null, "invalid error status did not schedule reconciliation");
+  poll = timerCallback; poll(); await new Promise((resolve) => setImmediate(resolve));
   assert(!elements.get("#switch-gallery-button").disabled, "valid reconciliation did not unlock submission");
   assert(!elements.get("#file-input").disabled, "valid reconciliation disabled active upload");
   await context.pollStatus();

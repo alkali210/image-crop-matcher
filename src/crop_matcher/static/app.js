@@ -156,6 +156,7 @@ function isValidStatusResponse(status) {
   if (status.state === "ready") {
     return (
       status.gallery_dir !== null &&
+      status.indexed_images >= 1 &&
       status.build_time_ms !== null &&
       status.error === null &&
       status.reindexing === (status.pending_gallery_dir !== null) &&
@@ -169,7 +170,9 @@ function isValidStatusResponse(status) {
     status.pending_gallery_dir === null &&
     status.reindexing === false &&
     status.switch_error === null &&
-    (status.state !== "building" || status.error === null)
+    (status.state === "building"
+      ? status.error === null
+      : typeof status.error === "string" && status.error.trim() !== "")
   );
 }
 
