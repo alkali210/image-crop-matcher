@@ -43,7 +43,7 @@ function setUploadEnabled(enabled) {
 
 function renderStatus(status) {
   const count = Number.isFinite(status.indexed_images) ? status.indexed_images : 0;
-  state.hasActiveGallery = typeof status.gallery_dir === "string" && status.gallery_dir.length > 0;
+  state.hasActiveGallery = status.state === "ready";
   indexStatus.dataset.state = status.state;
 
   if (status.state === "ready") {

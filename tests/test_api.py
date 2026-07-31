@@ -500,6 +500,152 @@ def test_frontend_submits_gallery_path_and_keeps_upload_during_reindex(tmp_path:
     assert "status.switch_error" in script
 
 
+def test_frontend_tracks_active_availability_across_poll_and_switch_races() -> None:
+    app_script = Path(__file__).parents[1] / "src" / "crop_matcher" / "static" / "app.js"
+    harness = r"""
+const fs = require("fs");
+const vm = require("vm");
+
+class Element {
+  constructor() {
+    this.attrs = new Map();
+    this.dataset = {};
+    this.disabled = false;
+    this.files = [];
+    this.hidden = true;
+    this.listeners = {};
+    this.textContent = "";
+    this.value = "";
+  }
+  addEventListener(name, callback) { this.listeners[name] = callback; }
+  append() {}
+  click() {}
+  contains() { return false; }
+  focus() {}
+  getAttribute(name) { return this.attrs.has(name) ? this.attrs.get(name) : null; }
+  removeAttribute(name) { this.attrs.delete(name); }
+  replaceChildren() {}
+  setAttribute(name, value) { this.attrs.set(name, String(value)); }
+}
+
+const selectors = [
+  "#drop-zone", "#file-input", "#index-status", "#status-text", "#loading-status",
+  "#error-message", "#upload-view", "#results-view", "#results-heading", "#query-summary",
+  "#query-preview", "#query-name", "#query-meta", "#result-list", "#reupload-button",
+  "#current-gallery-path", "#gallery-switch-form", "#gallery-path",
+  "#switch-gallery-button", "#gallery-switch-status",
+];
+const elements = new Map(selectors.map((selector) => [selector, new Element()]));
+elements.get("#drop-zone").setAttribute("aria-disabled", "true");
+elements.get("#loading-status").hidden = true;
+
+const responses = [];
+let timerCallback = null;
+const windowObject = {
+  addEventListener() {},
+  clearTimeout() { timerCallback = null; },
+  location: { origin: "http://testserver" },
+  setTimeout(callback) { timerCallback = callback; return 1; },
+};
+const context = {
+  console,
+  document: {
+    createElement() { return new Element(); },
+    createTextNode(text) { return { textContent: text }; },
+    querySelector(selector) { return elements.get(selector); },
+  },
+  fetch: (...args) => {
+    if (responses.length === 0) throw new Error(`unexpected fetch: ${args[0]}`);
+    return responses.shift()(...args);
+  },
+  FormData: class { append() {} },
+  URL,
+  window: windowObject,
+};
+vm.createContext(context);
+vm.runInContext(fs.readFileSync(process.argv[1], "utf8"), context);
+
+const jsonResponse = (body, ok = true) => async () => ({ ok, json: async () => body });
+const flush = async () => {
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+};
+const assert = (condition, message) => { if (!condition) throw new Error(message); };
+
+(async () => {
+  responses.push(jsonResponse({
+    state: "building", indexed_images: 0, gallery_dir: "C:\\not-active-yet",
+    pending_gallery_dir: null, reindexing: false, switch_error: null,
+  }));
+  await context.pollStatus();
+  assert(elements.get("#file-input").disabled, "initial build enabled upload");
+  assert(timerCallback !== null, "initial build did not schedule polling");
+
+  responses.push(async () => { throw new Error("status unavailable"); });
+  const retryAfterBuild = timerCallback;
+  retryAfterBuild();
+  await flush();
+  assert(elements.get("#file-input").disabled, "failed follow-up enabled upload without active bundle");
+  assert(timerCallback !== null, "status failure did not schedule retry");
+
+  responses.push(jsonResponse({
+    state: "ready", indexed_images: 3, gallery_dir: "C:\\active",
+    pending_gallery_dir: "C:\\pending", reindexing: true, switch_error: null,
+  }));
+  await context.pollStatus();
+  assert(!elements.get("#file-input").disabled, "active reindex disabled upload");
+  assert(elements.get("#switch-gallery-button").disabled, "reindex did not disable switch");
+  assert(timerCallback !== null, "reindex did not keep polling");
+
+  let resolveSubmission;
+  responses.push(() => new Promise((resolve) => { resolveSubmission = resolve; }));
+  elements.get("#gallery-path").value = "  C:\\next  ";
+  const submission = elements.get("#gallery-switch-form").listeners.submit({ preventDefault() {} });
+  await flush();
+  assert(elements.get("#switch-gallery-button").disabled, "submission did not disable switch");
+
+  responses.push(jsonResponse({
+    state: "ready", indexed_images: 3, gallery_dir: "C:\\active",
+    pending_gallery_dir: null, reindexing: false, switch_error: null,
+  }));
+  await context.pollStatus();
+  assert(elements.get("#switch-gallery-button").disabled, "poll won submission race");
+  resolveSubmission({
+    ok: true,
+    json: async () => ({
+      state: "ready", indexed_images: 3, gallery_dir: "C:\\active",
+      pending_gallery_dir: "C:\\next", reindexing: true, switch_error: null,
+    }),
+  });
+  await submission;
+  assert(elements.get("#switch-gallery-button").disabled, "accepted switch was not pending");
+  assert(!elements.get("#file-input").disabled, "accepted switch disabled active upload");
+
+  responses.push(jsonResponse({
+    state: "ready", indexed_images: 3, gallery_dir: "C:\\active",
+    pending_gallery_dir: null, reindexing: false, switch_error: "No supported images found",
+  }));
+  await context.pollStatus();
+  assert(!elements.get("#file-input").disabled, "switch failure disabled active upload");
+  assert(!elements.get("#switch-gallery-button").disabled, "switch failure left switch disabled");
+  assert(
+    elements.get("#gallery-switch-status").textContent.includes("No supported images found"),
+    "switch failure was not rendered",
+  );
+})().catch((error) => {
+  console.error(error.stack || error);
+  process.exitCode = 1;
+});
+"""
+
+    subprocess.run(
+        ["node", "-e", harness, str(app_script)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
 def test_upload_shell_lists_exact_supported_formats_and_limits(tmp_path: Path) -> None:
     with make_client(tmp_path) as client:
         response = client.get("/")
