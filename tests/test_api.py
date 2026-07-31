@@ -95,6 +95,10 @@ def test_status_match_and_safe_image_delivery(tmp_path: Path) -> None:
         assert isinstance(status["build_time_ms"], int)
         assert status["build_time_ms"] >= 0
         assert status["error"] is None
+        assert status["gallery_dir"] == str((tmp_path / "songs").resolve())
+        assert status["pending_gallery_dir"] is None
+        assert status["reindexing"] is False
+        assert status["switch_error"] is None
 
         source = cv2.imread(str(tmp_path / "songs" / "api-song" / "base.jpg"))
         query = cv2.resize(source[30:190, 30:190], (90, 90))
@@ -127,8 +131,9 @@ def test_status_match_and_safe_image_delivery(tmp_path: Path) -> None:
 def test_image_delivery_returns_404_for_catalog_path_outside_gallery(tmp_path: Path) -> None:
     with make_client(tmp_path) as client:
         assert wait_until_ready(client)["state"] == "ready"
-        catalog = client.app.state.services.snapshot().catalog
-        assert catalog is not None
+        active = client.app.state.gallery_manager.snapshot().active
+        assert active is not None
+        catalog = active.catalog
         record = catalog.records[0]
         outside = tmp_path / "outside.jpg"
         outside.write_bytes(record.path.read_bytes())
@@ -229,9 +234,9 @@ def test_matching_runs_in_a_worker_thread(tmp_path: Path, monkeypatch: pytest.Mo
 
     with make_client(tmp_path) as client:
         assert wait_until_ready(client)["state"] == "ready"
-        services = client.app.state.services
-        matcher = services.snapshot().matcher
-        assert matcher is not None
+        active = client.app.state.gallery_manager.snapshot().active
+        assert active is not None
+        matcher = active.matcher
         calls: list[object] = []
         original_to_thread = main_module.asyncio.to_thread
 
@@ -270,6 +275,34 @@ def test_build_failure_and_unavailable_match_are_structured(tmp_path: Path) -> N
     }
 
 
+def test_gallery_api_validates_conflicts_and_accepts_switch(tmp_path: Path) -> None:
+    second = tmp_path / "second"
+    second.mkdir()
+    with make_client(tmp_path) as client:
+        assert wait_until_ready(client)["state"] == "ready"
+
+        relative = client.post("/api/gallery", json={"path": "relative"})
+        missing = client.post("/api/gallery", json={"path": str(tmp_path / "missing")})
+        same = client.post("/api/gallery", json={"path": str(tmp_path / "songs")})
+        manager = client.app.state.gallery_manager
+        assert manager.reserve_switch(second) == "accepted"
+        pending = client.post("/api/gallery", json={"path": str(tmp_path / "songs")})
+        manager.run_reserved_switch(second)
+
+        third = tmp_path / "third"
+        third.mkdir()
+        accepted = client.post("/api/gallery", json={"path": str(third)})
+
+    assert relative.status_code == 400
+    assert relative.json()["error"]["code"] == "invalid_gallery"
+    assert missing.status_code == 400
+    assert missing.json()["error"]["code"] == "invalid_gallery"
+    assert same.status_code == 200
+    assert pending.status_code == 409
+    assert pending.json()["error"]["code"] == "gallery_switch_in_progress"
+    assert accepted.status_code == 202
+
+
 def test_tiny_featureless_gallery_becomes_ready_and_matches(tmp_path: Path) -> None:
     gallery = tmp_path / "songs"
     source_path = gallery / "tiny" / "base.png"
@@ -305,8 +338,9 @@ def test_internal_match_error_is_generic_and_does_not_leak_paths(
 ) -> None:
     with make_client(tmp_path) as client:
         assert wait_until_ready(client)["state"] == "ready"
-        matcher = client.app.state.services.snapshot().matcher
-        assert matcher is not None
+        active = client.app.state.gallery_manager.snapshot().active
+        assert active is not None
+        matcher = active.matcher
 
         def fail_match(_query: np.ndarray) -> None:
             raise RuntimeError(r"failed at D:\private\songs\secret.jpg")

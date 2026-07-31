@@ -3,11 +3,19 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 
+class GalleryRequest(BaseModel):
+    path: str
+
+
 class StatusResponse(BaseModel):
     state: Literal["building", "ready", "error"]
     indexed_images: int
     build_time_ms: int | None
     error: str | None
+    gallery_dir: str | None
+    pending_gallery_dir: str | None
+    reindexing: bool
+    switch_error: str | None
 
 
 class QueryInfo(BaseModel):
