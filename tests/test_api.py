@@ -2,6 +2,7 @@ from dataclasses import replace
 from io import BytesIO
 from pathlib import Path
 import subprocess
+from threading import Event, Thread
 import time
 from typing import Any
 
@@ -301,6 +302,55 @@ def test_gallery_api_validates_conflicts_and_accepts_switch(tmp_path: Path) -> N
     assert pending.status_code == 409
     assert pending.json()["error"]["code"] == "gallery_switch_in_progress"
     assert accepted.status_code == 202
+
+
+def test_shutdown_waits_for_accepted_gallery_build(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import crop_matcher.main as main_module
+
+    client = make_client(tmp_path)
+    client.__enter__()
+    manager = client.app.state.gallery_manager
+    started = Event()
+    released = Event()
+    shutdown_wait_started = Event()
+    shutdown_finished = Event()
+    second = tmp_path / "second"
+    second.mkdir()
+
+    def blocking_builder(_gallery_dir: Path, _cache_dir: Path) -> None:
+        started.set()
+        assert released.wait(timeout=5)
+        raise RuntimeError("expected test build failure")
+
+    assert wait_until_ready(client)["state"] == "ready"
+    manager._builder = blocking_builder
+    response = client.post("/api/gallery", json={"path": str(second)})
+    assert response.status_code == 202
+    assert started.wait(timeout=5)
+    original_gather = main_module.asyncio.gather
+
+    async def recording_gather(*awaitables: object) -> list[object]:
+        shutdown_wait_started.set()
+        return await original_gather(*awaitables)
+
+    monkeypatch.setattr(main_module.asyncio, "gather", recording_gather)
+
+    def shut_down() -> None:
+        client.__exit__(None, None, None)
+        shutdown_finished.set()
+
+    worker = Thread(target=shut_down)
+    worker.start()
+    try:
+        assert shutdown_wait_started.wait(timeout=5)
+        assert not shutdown_finished.is_set()
+    finally:
+        released.set()
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+    assert shutdown_finished.is_set()
 
 
 def test_tiny_featureless_gallery_becomes_ready_and_matches(tmp_path: Path) -> None:

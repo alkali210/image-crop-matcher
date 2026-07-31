@@ -235,6 +235,35 @@ def test_removed_reserved_gallery_clears_pending_switch(
     assert snapshot.switch_error == "Failed to switch gallery"
 
 
+def test_retargeted_reserved_path_clears_only_its_pending_switch(
+    manager: GalleryManager,
+    first_gallery: Path,
+    second_gallery: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager.initialize(first_gallery)
+    reserved = second_gallery.resolve()
+    manager.reserve_switch(second_gallery)
+    retargeted = tmp_path / "retargeted"
+    retargeted.mkdir()
+    original_resolve = Path.resolve
+
+    def retarget_after_reservation(path: Path, strict: bool = False) -> Path:
+        if path == second_gallery:
+            return retargeted
+        return original_resolve(path, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", retarget_after_reservation)
+
+    manager.run_reserved_switch(second_gallery)
+
+    snapshot = manager.snapshot()
+    assert reserved != retargeted
+    assert snapshot.pending_gallery_dir is None
+    assert snapshot.switch_error == "Failed to switch gallery"
+
+
 def test_gallery_switch_conflicts_while_initial_bundle_is_building(
     tmp_path: Path, first_gallery: Path, second_gallery: Path
 ) -> None:

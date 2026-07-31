@@ -108,24 +108,22 @@ class GalleryManager:
         return "accepted"
 
     def run_reserved_switch(self, path: Path) -> None:
-        candidate = path.resolve(strict=False)
-        resolved: Path | None = None
+        with self._lock:
+            reserved = self._snapshot.pending_gallery_dir
         try:
-            with self._lock:
-                pending = self._snapshot.pending_gallery_dir
-                if pending != candidate:
-                    raise GalleryConflictError("The gallery switch was not reserved")
-                resolved = pending
-            if resolved is None or not resolved.is_dir():
+            candidate = path.resolve(strict=False)
+            if reserved is None or reserved != candidate:
+                raise GalleryConflictError("The gallery switch was not reserved")
+            if not reserved.is_dir():
                 raise GalleryPathError("Gallery path must be a directory")
-            cache_dir = gallery_cache_dir(self.settings.cache_dir, resolved)
-            bundle = self._builder(resolved, cache_dir)
-            self.selection_store.save(resolved)
+            cache_dir = gallery_cache_dir(self.settings.cache_dir, reserved)
+            bundle = self._builder(reserved, cache_dir)
+            self.selection_store.save(reserved)
         except Exception:
             logger.exception("Failed to switch galleries")
             with self._lock:
                 snapshot = self._snapshot
-                if snapshot.pending_gallery_dir == resolved:
+                if reserved is not None and snapshot.pending_gallery_dir is reserved:
                     self._snapshot = replace(
                         snapshot,
                         pending_gallery_dir=None,
@@ -134,7 +132,7 @@ class GalleryManager:
             return
 
         with self._lock:
-            if self._snapshot.pending_gallery_dir != resolved:
+            if self._snapshot.pending_gallery_dir is not reserved:
                 return
             self._snapshot = GallerySnapshot("ready", bundle, None, None, None)
 

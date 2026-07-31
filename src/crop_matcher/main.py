@@ -122,8 +122,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "A gallery switch is already in progress",
             ) from None
         if reservation == "accepted":
+            reserved_path = manager.snapshot().pending_gallery_dir
+            if reserved_path is None:
+                raise RuntimeError("Accepted gallery switch has no reservation")
             task = asyncio.create_task(
-                asyncio.to_thread(manager.run_reserved_switch, Path(request.path))
+                asyncio.to_thread(manager.run_reserved_switch, reserved_path)
             )
             build_tasks.add(task)
             task.add_done_callback(build_tasks.discard)
