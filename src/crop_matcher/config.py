@@ -15,3 +15,4 @@ class Settings:
     sift_contrast_threshold: float = 0.02
     candidate_count: int = 10
     tile_sizes: tuple[int, ...] = (64, 96, 128, 192, 256)
+    coarse_template_edge: int = 16

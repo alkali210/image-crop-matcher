@@ -12,12 +12,12 @@ import numpy as np
 
 from crop_matcher.catalog import ImageCatalog, ImageRecord
 from crop_matcher.config import Settings
+from crop_matcher.determinism import DEFAULT_SEED, seed_opencv
 from crop_matcher.feature_index import FeatureIndex
 from crop_matcher.imaging import read_image
 from crop_matcher.matcher import ImageMatcher
 
 
-DEFAULT_SEED = 20260730
 OUTPUT_SIZES = (64, 90, 128, 192)
 ACCURACY_TARGET = 0.95
 OWNERSHIP_MARKER = ".benchmark-owned"
@@ -157,13 +157,6 @@ def accuracy_exit_status(accuracy: float) -> int:
     return int(accuracy < ACCURACY_TARGET)
 
 
-def _seed_opencv(seed: int) -> None:
-    set_seed = getattr(cv2, "setRNGSeed", None)
-    if callable(set_seed):
-        signed_seed = ((seed + 2**31) % 2**32) - 2**31
-        set_seed(signed_seed)
-
-
 def _limited_catalog(catalog: ImageCatalog, max_images: int | None) -> ImageCatalog:
     if max_images is None:
         return catalog
@@ -183,6 +176,7 @@ def _bounded_cache_dir(catalog: ImageCatalog, settings: Settings, max_images: in
             "sift_features": settings.sift_features,
             "sift_contrast_threshold": settings.sift_contrast_threshold,
             "tile_sizes": list(settings.tile_sizes),
+            "coarse_template_edge": settings.coarse_template_edge,
         },
         "images": [asdict(entry) for entry in catalog.manifest],
     }
@@ -210,7 +204,7 @@ def run_benchmark(
     seed: int,
     failure_dir: Path,
 ) -> int:
-    _seed_opencv(seed)
+    seed_opencv(seed)
     run_failure_dir = prepare_failure_run_dir(
         failure_dir,
         gallery,
@@ -240,7 +234,7 @@ def run_benchmark(
     matcher.match(warmup)
 
     correct = 0
-    method_counts = {"sift": 0, "phash": 0}
+    method_counts = {"sift": 0, "template": 0}
     latencies_ms: list[float] = []
     for query_number, spec in enumerate(specs, start=1):
         record = catalog.records[spec.image_index]
@@ -272,7 +266,7 @@ def run_benchmark(
     p50, p95 = np.percentile(latencies_ms, [50, 95])
     print(f"images={len(catalog.records)} queries={query_count}")
     print(f"top1={correct}/{query_count} accuracy={accuracy:.2%}")
-    print(f"method_sift={method_counts['sift']} method_phash={method_counts['phash']}")
+    print(f"method_sift={method_counts['sift']} method_template={method_counts['template']}")
     print(f"latency_ms_p50={p50:.3f} latency_ms_p95={p95:.3f}")
     return accuracy_exit_status(accuracy)
 

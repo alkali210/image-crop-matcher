@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 import json
 from pathlib import Path
 from threading import Barrier, Lock
@@ -12,7 +13,7 @@ import pytest
 from crop_matcher import matcher as matcher_module
 from crop_matcher.catalog import ImageCatalog, ImageRecord
 from crop_matcher.config import Settings
-from crop_matcher.feature_index import FeatureIndex, ImageFeatures, TileFeatures
+from crop_matcher.feature_index import CoarseTemplateFeatures, FeatureIndex, ImageFeatures
 from crop_matcher.matcher import CandidateScore, ImageMatcher, MatchResult
 
 
@@ -52,6 +53,23 @@ def write_png(path: Path, image: np.ndarray) -> None:
 def record(image_id: str) -> ImageRecord:
     path = Path(f"{image_id}.png")
     return ImageRecord(image_id, path, path, "", path.name, 1, 1)
+
+
+def coarse_templates(
+    levels: list[tuple[int, np.ndarray, int]],
+) -> CoarseTemplateFeatures:
+    pixels = [np.asarray(level, dtype=np.uint8).reshape(-1) for _, level, _ in levels]
+    offsets = np.zeros(len(levels) + 1, dtype=np.int64)
+    if levels:
+        np.cumsum([level.size for level in pixels], out=offsets[1:])
+    return CoarseTemplateFeatures(
+        pixels=np.concatenate(pixels) if pixels else np.empty(0, np.uint8),
+        offsets=offsets,
+        widths=np.asarray([level.shape[1] for _, level, _ in levels], np.int32),
+        heights=np.asarray([level.shape[0] for _, level, _ in levels], np.int32),
+        image_indices=np.asarray([owner for owner, _, _ in levels], np.int32),
+        region_sizes=np.asarray([size for _, _, size in levels], np.int32),
+    )
 
 
 class FakeGlobalMatcher:
@@ -149,48 +167,111 @@ def test_low_feature_crop_uses_fallback(tmp_path: Path) -> None:
     result = matcher.match(query)
 
     assert result.record.parent_name == "square"
-    assert result.method == "phash"
+    assert result.method == "template"
     assert result.similarity <= 89.9
 
 
-def test_fallback_skips_invalid_and_duplicate_tile_owners(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    first_path = tmp_path / "first.png"
-    second_path = tmp_path / "second.png"
-    first_path.write_bytes(b"fixture")
-    second_path.write_bytes(b"fixture")
-    records = (
-        ImageRecord("first", first_path, Path("first.png"), "", "first.png", 1, 1),
-        ImageRecord("second", second_path, Path("second.png"), "", "second.png", 1, 1),
-    )
+def test_coarse_candidates_find_owner_beyond_candidate_count() -> None:
+    image_ids = tuple(f"image-{index:02d}" for index in range(12))
+    query = np.arange(256, dtype=np.uint8).reshape(16, 16)
+    levels = [(index, np.full((32, 32), index, np.uint8), 16) for index in range(11)]
+    target = np.zeros((32, 32), np.uint8)
+    target[7:23, 9:25] = query
+    levels.append((11, target, 16))
     matcher = ImageMatcher.__new__(ImageMatcher)
-    matcher.catalog = ImageCatalog(tmp_path, records, ())
+    matcher.index = SimpleNamespace(
+        image_ids=image_ids,
+        coarse_templates=coarse_templates(levels),
+    )
+    matcher.settings = Settings(candidate_count=3)
+
+    candidates = matcher._coarse_candidates(query, set(), requested_count=1)
+
+    assert candidates[0] == 11
+    assert len(candidates) == 3
+
+
+def test_coarse_candidates_exclude_existing_ids_and_keep_owner_maximum(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    matcher = ImageMatcher.__new__(ImageMatcher)
+    matcher.index = SimpleNamespace(
+        image_ids=("a", "b", "c"),
+        coarse_templates=coarse_templates(
+            [
+                (0, np.full((16, 16), 10, np.uint8), 16),
+                (1, np.full((16, 16), 20, np.uint8), 16),
+                (1, np.full((16, 16), 30, np.uint8), 32),
+                (2, np.full((16, 16), 40, np.uint8), 16),
+            ]
+        ),
+    )
+    matcher.settings = Settings(candidate_count=3)
+    responses = iter((0.1, 0.2, 0.9, 0.8))
+    monkeypatch.setattr(
+        matcher,
+        "_coarse_template_peak",
+        lambda _candidate, _query: next(responses),
+        raising=False,
+    )
+
+    candidates = matcher._coarse_candidates(np.zeros((16, 16), np.uint8), {"c"}, 1)
+
+    assert candidates == [1, 0]
+
+
+def test_coarse_candidates_stably_rank_ties_then_fill_unscored_owners(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    matcher = ImageMatcher.__new__(ImageMatcher)
+    matcher.index = SimpleNamespace(
+        image_ids=("z", "b", "a", "empty"),
+        coarse_templates=coarse_templates(
+            [
+                (0, np.zeros((16, 16), np.uint8), 16),
+                (1, np.zeros((16, 16), np.uint8), 16),
+                (2, np.zeros((8, 8), np.uint8), 16),
+            ]
+        ),
+    )
+    matcher.settings = Settings(candidate_count=4)
+    monkeypatch.setattr(
+        matcher,
+        "_coarse_template_peak",
+        lambda _candidate, _query: 0.75,
+        raising=False,
+    )
+
+    candidates = matcher._coarse_candidates(np.zeros((16, 16), np.uint8), set(), 4)
+
+    assert candidates == [1, 0, 2, 3]
+
+
+def test_coarse_candidates_ignore_nonfinite_template_responses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    matcher = ImageMatcher.__new__(ImageMatcher)
     matcher.index = SimpleNamespace(
         image_ids=("first", "second"),
-        tiles=TileFeatures(
-            hashes=np.asarray([0, 1, 3, 7], np.uint64),
-            image_indices=np.asarray([99, 0, 0, 1], np.int32),
-            xs=np.zeros(4, np.int32),
-            ys=np.zeros(4, np.int32),
-            sizes=np.full(4, 64, np.int32),
+        coarse_templates=coarse_templates(
+            [
+                (0, np.zeros((16, 16), np.uint8), 16),
+                (1, np.ones((16, 16), np.uint8), 16),
+            ]
         ),
     )
     matcher.settings = Settings(candidate_count=2)
-    scored_indices: list[int] = []
+    responses = iter((np.nan, 0.6))
+    monkeypatch.setattr(
+        matcher,
+        "_coarse_template_peak",
+        lambda _candidate, _query: next(responses),
+        raising=False,
+    )
 
-    def template_score(image_index: int, _query_gray: np.ndarray) -> float:
-        scored_indices.append(image_index)
-        return (0.5, 0.9)[image_index]
+    candidates = matcher._coarse_candidates(np.zeros((16, 16), np.uint8), set(), 2)
 
-    monkeypatch.setattr(matcher, "_template_score", template_score, raising=False)
-
-    results = matcher._fallback_results(np.zeros((64, 64), np.uint8), set())
-
-    assert scored_indices == [0, 1]
-    assert [result.record.image_id for result in results] == ["second", "first"]
-    assert [result.similarity for result in results] == [89.9, 57.5]
-    assert all(result.method == "phash" for result in results)
+    assert candidates == [1, 0]
 
 
 def test_template_score_uses_only_bounded_candidate_levels(
@@ -212,12 +293,8 @@ def test_template_score_uses_only_bounded_candidate_levels(
     matcher.settings = settings
     matcher.index = SimpleNamespace(
         image_ids=(record.image_id,),
-        tiles=TileFeatures(
-            hashes=np.zeros(3, np.uint64),
-            image_indices=np.zeros(3, np.int32),
-            xs=np.zeros(3, np.int32),
-            ys=np.zeros(3, np.int32),
-            sizes=np.asarray(settings.tile_sizes, np.int32),
+        coarse_templates=coarse_templates(
+            [(0, np.zeros((16, 16), np.uint8), size) for size in (64, 80, 96)]
         ),
     )
     calls: list[tuple[tuple[int, int], tuple[int, int]]] = []
@@ -232,12 +309,12 @@ def test_template_score_uses_only_bounded_candidate_levels(
         return np.zeros(response_shape, np.float32)
 
     monkeypatch.setattr(cv2, "matchTemplate", match_template)
-    query = cv2.cvtColor(cv2.resize(source[40:120, 60:180], (120, 80)), cv2.COLOR_BGR2GRAY)
+    query = cv2.cvtColor(cv2.resize(source[40:120, 60:180], (60, 40)), cv2.COLOR_BGR2GRAY)
 
     score = matcher._template_score(0, query)
 
     assert 0.0 <= score <= 1.0
-    assert len(calls) == 4
+    assert len(calls) == 6
     assert all(query_shape == query.shape for _, query_shape in calls)
     assert all(
         query.shape[0] <= candidate_shape[0] <= 120 and query.shape[1] <= candidate_shape[1] <= 160
@@ -413,12 +490,13 @@ def test_match_ranks_by_raw_score_and_applies_bounded_margin(
         )
     )
     matcher._sift_lock = Lock()
+    matcher.settings = Settings()
     monkeypatch.setattr(matcher, "_feature_query", lambda query: (query, 1.0))
     monkeypatch.setattr(matcher, "_retrieve", lambda _descriptors: ["second", "best"])
     monkeypatch.setattr(matcher, "_verify", lambda image_id, *_args: scores[image_id])
 
-    results = matcher.match_many(np.zeros((8, 8), np.uint8), limit=2)
-    result = matcher.match(np.zeros((8, 8), np.uint8))
+    results = matcher.match_many(np.zeros((64, 64), np.uint8), limit=2)
+    result = matcher.match(np.zeros((64, 64), np.uint8))
 
     assert result.record == best_record
     assert result.similarity == pytest.approx(45.5)
@@ -439,6 +517,7 @@ def test_match_many_merges_distinct_results_in_deterministic_order(
         )
     )
     matcher._sift_lock = Lock()
+    matcher.settings = Settings()
     monkeypatch.setattr(matcher, "_feature_query", lambda query: (query, 1.0))
     primary = [
         MatchResult(records[0], 80.0, "sift", 4, 1.0, 0.8),
@@ -451,19 +530,163 @@ def test_match_many_merges_distinct_results_in_deterministic_order(
         assert exclude_ids == {"a", "b"}
         assert requested_count == 1
         return [
-            MatchResult(records[0], 99.0, "phash", 0, 0.0, 0.9),
-            MatchResult(records[2], 90.0, "phash", 0, 0.0, 0.9),
-            MatchResult(records[3], 70.0, "phash", 0, 0.0, 0.7),
+            MatchResult(records[0], 99.0, "template", 0, 0.0, 0.9),
+            MatchResult(records[2], 90.0, "template", 0, 0.0, 0.9),
+            MatchResult(records[3], 70.0, "template", 0, 0.0, 0.7),
         ]
 
     monkeypatch.setattr(matcher, "_primary_results", lambda *_args: primary, raising=False)
     monkeypatch.setattr(matcher, "_fallback_results", fallback, raising=False)
 
-    results = matcher.match_many(np.zeros((8, 8), np.uint8), limit=3)
+    results = matcher.match_many(np.zeros((64, 64), np.uint8), limit=3)
 
-    assert [result.record.image_id for result in results] == ["c", "a", "b"]
+    assert [result.record.image_id for result in results] == ["b", "c", "a"]
     assert len({result.record.image_id for result in results}) == 3
-    assert [result.similarity for result in results] == [90.0, 80.0, 80.0]
+    assert [result.similarity for result in results] == [99.0, 90.0, 80.0]
+    assert results[0].method == "template"
+
+
+def test_tiny_query_full_primary_allows_stronger_template_to_win(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    primary_record, template_record = (record(image_id) for image_id in ("primary", "template"))
+    matcher = ImageMatcher.__new__(ImageMatcher)
+    matcher.catalog = ImageCatalog(Path(), (primary_record, template_record), ())
+    matcher.settings = Settings(tile_sizes=(64, 96))
+    matcher._sift = SimpleNamespace(
+        detectAndCompute=lambda *_args: (
+            [SimpleNamespace(pt=(float(index), float(index))) for index in range(4)],
+            np.zeros((4, 128), np.float32),
+        )
+    )
+    matcher._sift_lock = Lock()
+    monkeypatch.setattr(matcher, "_feature_query", lambda query: (query, 1.0))
+    monkeypatch.setattr(
+        matcher,
+        "_primary_results",
+        lambda *_args: [MatchResult(primary_record, 35.0, "sift", 4, 1.0, 0.3)],
+    )
+
+    def fallback(
+        _query: np.ndarray, exclude_ids: set[str], requested_count: int
+    ) -> list[MatchResult]:
+        assert exclude_ids == set()
+        assert requested_count == 1
+        return [MatchResult(template_record, 80.0, "template", 0, 0.0, 0.9)]
+
+    monkeypatch.setattr(matcher, "_fallback_results", fallback)
+
+    result = matcher.match_many(np.zeros((57, 57), np.uint8), limit=1)
+
+    assert result == [MatchResult(template_record, 80.0, "template", 0, 0.0, 0.9)]
+
+
+def test_full_primary_at_smallest_tile_size_skips_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    primary_record = record("primary")
+    matcher = ImageMatcher.__new__(ImageMatcher)
+    matcher.catalog = ImageCatalog(Path(), (primary_record,), ())
+    matcher.settings = Settings(tile_sizes=(64, 96))
+    matcher._sift = SimpleNamespace(
+        detectAndCompute=lambda *_args: (
+            [SimpleNamespace(pt=(float(index), float(index))) for index in range(4)],
+            np.zeros((4, 128), np.float32),
+        )
+    )
+    matcher._sift_lock = Lock()
+    monkeypatch.setattr(matcher, "_feature_query", lambda query: (query, 1.0))
+    monkeypatch.setattr(
+        matcher,
+        "_primary_results",
+        lambda *_args: [MatchResult(primary_record, 35.0, "sift", 4, 1.0, 0.3)],
+    )
+    monkeypatch.setattr(
+        matcher,
+        "_fallback_results",
+        lambda *_args: pytest.fail("64x64 full primary reached fallback"),
+    )
+
+    result = matcher.match_many(np.zeros((64, 64), np.uint8), limit=1)
+
+    assert result[0].record == primary_record
+
+
+def test_tiny_query_same_owner_keeps_higher_similarity_and_stays_limited(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    records = tuple(record(image_id) for image_id in ("same", "primary", "template", "extra"))
+    matcher = ImageMatcher.__new__(ImageMatcher)
+    matcher.catalog = ImageCatalog(Path(), records, ())
+    matcher.settings = Settings(tile_sizes=(64, 96))
+    matcher._sift = SimpleNamespace(
+        detectAndCompute=lambda *_args: (
+            [SimpleNamespace(pt=(float(index), float(index))) for index in range(4)],
+            np.zeros((4, 128), np.float32),
+        )
+    )
+    matcher._sift_lock = Lock()
+    monkeypatch.setattr(matcher, "_feature_query", lambda query: (query, 1.0))
+    monkeypatch.setattr(
+        matcher,
+        "_primary_results",
+        lambda *_args: [
+            MatchResult(records[0], 80.0, "sift", 4, 1.0, 0.8),
+            MatchResult(records[1], 70.0, "sift", 4, 1.0, 0.7),
+        ],
+    )
+
+    def fallback(
+        _query: np.ndarray, exclude_ids: set[str], requested_count: int
+    ) -> list[MatchResult]:
+        assert exclude_ids == set()
+        assert requested_count == 3
+        return [
+            MatchResult(records[0], 89.9, "template", 0, 0.0, 0.99),
+            MatchResult(records[2], 85.0, "template", 0, 0.0, 0.9),
+            MatchResult(records[3], 60.0, "template", 0, 0.0, 0.6),
+        ]
+
+    monkeypatch.setattr(matcher, "_fallback_results", fallback)
+
+    results = matcher.match_many(np.zeros((57, 57), np.uint8), limit=3)
+
+    assert [result.record.image_id for result in results] == ["same", "template", "primary"]
+    assert len(results) == len({result.record.image_id for result in results}) == 3
+    same_owner = next(result for result in results if result.record.image_id == "same")
+    assert same_owner.method == "template"
+    assert same_owner.similarity == 89.9
+
+
+def test_tiny_query_same_owner_similarity_tie_keeps_sift(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    same_record = record("same")
+    matcher = ImageMatcher.__new__(ImageMatcher)
+    matcher.catalog = ImageCatalog(Path(), (same_record,), ())
+    matcher.settings = Settings(tile_sizes=(64, 96))
+    matcher._sift = SimpleNamespace(
+        detectAndCompute=lambda *_args: (
+            [SimpleNamespace(pt=(float(index), float(index))) for index in range(4)],
+            np.zeros((4, 128), np.float32),
+        )
+    )
+    matcher._sift_lock = Lock()
+    monkeypatch.setattr(matcher, "_feature_query", lambda query: (query, 1.0))
+    monkeypatch.setattr(
+        matcher,
+        "_primary_results",
+        lambda *_args: [MatchResult(same_record, 80.0, "sift", 4, 1.0, 0.8)],
+    )
+    monkeypatch.setattr(
+        matcher,
+        "_fallback_results",
+        lambda *_args: [MatchResult(same_record, 80.0, "template", 0, 0.0, 0.9)],
+    )
+
+    results = matcher.match_many(np.zeros((57, 57), np.uint8), limit=1)
+
+    assert results == [MatchResult(same_record, 80.0, "sift", 4, 1.0, 0.8)]
 
 
 def test_match_many_returns_all_results_when_gallery_has_fewer_than_limit(tmp_path: Path) -> None:
@@ -497,7 +720,7 @@ def test_match_many_fallback_fills_limit_beyond_candidate_count(tmp_path: Path) 
 
     assert len(results) == 3
     assert len({result.record.image_id for result in results}) == 3
-    assert all(result.method == "phash" for result in results)
+    assert all(result.method == "template" for result in results)
 
 
 def test_match_remains_first_match_many_result(tmp_path: Path) -> None:
@@ -565,13 +788,7 @@ def test_fallback_empty_index_uses_private_error() -> None:
     matcher.catalog = ImageCatalog(Path(), (), ())
     matcher.index = SimpleNamespace(
         image_ids=(),
-        tiles=TileFeatures(
-            hashes=np.empty(0, np.uint64),
-            image_indices=np.empty(0, np.int32),
-            xs=np.empty(0, np.int32),
-            ys=np.empty(0, np.int32),
-            sizes=np.empty(0, np.int32),
-        ),
+        coarse_templates=coarse_templates([]),
     )
     matcher.settings = Settings()
 
@@ -638,6 +855,22 @@ def test_benchmark_accuracy_exit_status_uses_95_percent_boundary() -> None:
     assert accuracy_exit_status(1.0) == 0
     assert accuracy_exit_status(0.95) == 0
     assert accuracy_exit_status(0.9499) == 1
+
+
+def test_bounded_benchmark_cache_namespace_includes_coarse_template_edge(tmp_path: Path) -> None:
+    from benchmarks.benchmark import _bounded_cache_dir
+
+    catalog = ImageCatalog(tmp_path / "songs", (), ())
+    settings = Settings(cache_dir=tmp_path / "cache", coarse_template_edge=16)
+
+    first = _bounded_cache_dir(catalog, settings, max_images=1)
+    second = _bounded_cache_dir(
+        catalog,
+        replace(settings, coarse_template_edge=32),
+        max_images=1,
+    )
+
+    assert first != second
 
 
 def test_benchmark_failure_json_has_exact_metadata(tmp_path: Path) -> None:
@@ -865,7 +1098,10 @@ def test_benchmark_cli_returns_zero_at_accuracy_target(
     output = capsys.readouterr().out.splitlines()
     assert exit_status == 0
     assert output[:2] == ["images=1 queries=1", "top1=1/1 accuracy=100.00%"]
-    assert output[2] in {"method_sift=1 method_phash=0", "method_sift=0 method_phash=1"}
+    assert output[2] in {
+        "method_sift=1 method_template=0",
+        "method_sift=0 method_template=1",
+    }
     assert output[3].startswith("latency_ms_p50=")
     assert " latency_ms_p95=" in output[3]
     assert (tmp_path / "benchmark-failures").is_dir()

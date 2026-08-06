@@ -1,5 +1,5 @@
-from dataclasses import replace
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import cv2
@@ -56,59 +56,78 @@ def test_builds_global_descriptors_and_round_trips_cache(tmp_path: Path) -> None
     assert np.array_equal(loaded.descriptor_image_indices, built.descriptor_image_indices)
 
 
-def test_feature_index_builds_typed_hash_tiles(tmp_path: Path) -> None:
+def test_feature_index_builds_typed_contiguous_coarse_template_pyramid(
+    tmp_path: Path,
+) -> None:
     gallery = tmp_path / "songs"
-    write_textured_image(gallery / "one" / "base.jpg", 0)
-    settings = Settings(gallery_dir=gallery, cache_dir=tmp_path / "cache")
+    write_textured_image(gallery / "one" / "base.jpg", 0, shape=(120, 160))
+    settings = Settings(
+        gallery_dir=gallery,
+        cache_dir=tmp_path / "cache",
+        tile_sizes=(40, 80, 120, 200),
+        coarse_template_edge=16,
+    )
     catalog = ImageCatalog.scan(gallery, settings.max_image_pixels)
 
     built = FeatureIndex.load_or_build(catalog, settings)
     loaded = FeatureIndex.load_or_build(catalog, settings)
 
-    expected_dtypes = (np.uint64, np.int32, np.int32, np.int32, np.int32)
+    expected_dtypes = (np.uint8, np.int64, np.int32, np.int32, np.int32, np.int32)
     built_arrays = (
-        built.tiles.hashes,
-        built.tiles.image_indices,
-        built.tiles.xs,
-        built.tiles.ys,
-        built.tiles.sizes,
+        built.coarse_templates.pixels,
+        built.coarse_templates.offsets,
+        built.coarse_templates.widths,
+        built.coarse_templates.heights,
+        built.coarse_templates.image_indices,
+        built.coarse_templates.region_sizes,
     )
     loaded_arrays = (
-        loaded.tiles.hashes,
-        loaded.tiles.image_indices,
-        loaded.tiles.xs,
-        loaded.tiles.ys,
-        loaded.tiles.sizes,
+        loaded.coarse_templates.pixels,
+        loaded.coarse_templates.offsets,
+        loaded.coarse_templates.widths,
+        loaded.coarse_templates.heights,
+        loaded.coarse_templates.image_indices,
+        loaded.coarse_templates.region_sizes,
     )
-    assert len(built.tiles.hashes) > 0
-    assert all(array.shape == built.tiles.hashes.shape for array in built_arrays)
+    assert built.coarse_templates.region_sizes.tolist() == [40, 60, 80, 100, 120]
+    assert built.coarse_templates.widths.tolist() == [64, 43, 32, 26, 21]
+    assert built.coarse_templates.heights.tolist() == [48, 32, 24, 19, 16]
+    assert built.coarse_templates.image_indices.tolist() == [0, 0, 0, 0, 0]
+    assert built.coarse_templates.offsets.tolist() == [0, 3072, 4448, 5216, 5710, 6046]
     for built_array, loaded_array, dtype in zip(
         built_arrays, loaded_arrays, expected_dtypes, strict=True
     ):
         assert built_array.dtype == dtype
         assert built_array.flags.c_contiguous
+        assert built_array.flags.writeable is False
         assert np.array_equal(loaded_array, built_array)
+        assert loaded_array.flags.c_contiguous
+        assert loaded_array.flags.writeable is False
 
 
-def test_feature_index_includes_right_and_bottom_aligned_tiles(tmp_path: Path) -> None:
+def test_coarse_template_pixels_are_grayscale_level_images(tmp_path: Path) -> None:
     gallery = tmp_path / "songs"
-    write_textured_image(gallery / "one" / "base.jpg", 0, shape=(130, 150))
+    write_blank_image(gallery / "one" / "base.png", shape=(40, 60))
     settings = Settings(
         gallery_dir=gallery,
         cache_dir=tmp_path / "cache",
-        tile_sizes=(64,),
+        tile_sizes=(20,),
+        coarse_template_edge=10,
     )
     catalog = ImageCatalog.scan(gallery, settings.max_image_pixels)
 
     index = FeatureIndex.load_or_build(catalog, settings)
 
-    positions = set(zip(index.tiles.xs.tolist(), index.tiles.ys.tolist(), strict=True))
-    assert positions == {(x, y) for x in (0, 32, 64, 86) for y in (0, 32, 64, 66)}
-    assert set(index.tiles.sizes) == {64}
-    assert set(index.tiles.image_indices) == {0}
+    assert index.coarse_templates.widths.tolist() == [30]
+    assert index.coarse_templates.heights.tolist() == [20]
+    assert index.coarse_templates.offsets.tolist() == [0, 600]
+    assert index.coarse_templates.pixels.shape == (600,)
+    assert np.all(index.coarse_templates.pixels == 0)
 
 
-def test_images_smaller_than_every_tile_size_get_persisted_fallback_tile(tmp_path: Path) -> None:
+def test_image_smaller_than_every_region_size_gets_short_edge_fallback_level(
+    tmp_path: Path,
+) -> None:
     gallery = tmp_path / "songs"
     write_blank_image(gallery / "small" / "base.png")
     settings = Settings(
@@ -121,18 +140,21 @@ def test_images_smaller_than_every_tile_size_get_persisted_fallback_tile(tmp_pat
     built = FeatureIndex.load_or_build(catalog, settings)
     loaded = FeatureIndex.load_or_build(catalog, settings)
 
-    assert built.tiles.hashes.shape == (1,)
-    assert built.tiles.image_indices.tolist() == [0]
-    assert built.tiles.xs.tolist() == [0]
-    assert built.tiles.ys.tolist() == [0]
-    assert built.tiles.sizes.tolist() == [40]
-    assert np.array_equal(loaded.tiles.hashes, built.tiles.hashes)
-    assert np.array_equal(loaded.tiles.image_indices, built.tiles.image_indices)
-    assert np.array_equal(loaded.tiles.sizes, built.tiles.sizes)
+    assert built.coarse_templates.region_sizes.tolist() == [40]
+    assert built.coarse_templates.image_indices.tolist() == [0]
+    assert built.coarse_templates.widths.tolist() == [24]
+    assert built.coarse_templates.heights.tolist() == [16]
+    assert built.coarse_templates.offsets.tolist() == [0, 384]
+    assert np.array_equal(loaded.coarse_templates.pixels, built.coarse_templates.pixels)
+    assert np.array_equal(loaded.coarse_templates.region_sizes, built.coarse_templates.region_sizes)
     assert loaded.loaded_from_cache is True
 
 
-def test_cache_without_fallback_evidence_for_every_image_is_rebuilt(tmp_path: Path) -> None:
+def test_region_sizes_keep_fitting_midpoint_when_larger_configured_size_does_not_fit() -> None:
+    assert FeatureIndex._region_sizes(240, (192, 256)) == [192, 224]
+
+
+def test_cache_without_coarse_level_for_every_image_is_rebuilt(tmp_path: Path) -> None:
     gallery = tmp_path / "songs"
     write_textured_image(gallery / "one" / "base.jpg", 0)
     write_textured_image(gallery / "two" / "base.jpg", 10)
@@ -142,33 +164,22 @@ def test_cache_without_fallback_evidence_for_every_image_is_rebuilt(tmp_path: Pa
     cache_path = settings.cache_dir / "features.npz"
     with np.load(cache_path, allow_pickle=False) as cache:
         arrays = {name: cache[name] for name in cache.files}
-    keep = arrays["tile_image_indices"] == 0
-    for name in ("tile_hashes", "tile_image_indices", "tile_xs", "tile_ys", "tile_sizes"):
-        arrays[name] = arrays[name][keep]
+    level_count = int(np.count_nonzero(arrays["coarse_image_indices"] == 0))
+    arrays["coarse_pixels"] = arrays["coarse_pixels"][: arrays["coarse_offsets"][level_count]]
+    arrays["coarse_offsets"] = arrays["coarse_offsets"][: level_count + 1]
+    for name in (
+        "coarse_widths",
+        "coarse_heights",
+        "coarse_image_indices",
+        "coarse_region_sizes",
+    ):
+        arrays[name] = arrays[name][:level_count]
     np.savez(cache_path, **arrays)
 
     rebuilt = FeatureIndex.load_or_build(catalog, settings)
 
     assert rebuilt.loaded_from_cache is False
-    assert set(rebuilt.tiles.image_indices.tolist()) == {0, 1}
-
-
-def test_single_pixel_tile_size_uses_a_safe_stride(tmp_path: Path) -> None:
-    gallery = tmp_path / "songs"
-    write_blank_image(gallery / "small" / "base.png", shape=(8, 8))
-    settings = Settings(
-        gallery_dir=gallery,
-        cache_dir=tmp_path / "cache",
-        tile_sizes=(1,),
-    )
-    catalog = ImageCatalog.scan(gallery, settings.max_image_pixels)
-
-    index = FeatureIndex.load_or_build(catalog, settings)
-
-    assert index.tiles.hashes.shape == (64,)
-    assert set(zip(index.tiles.xs, index.tiles.ys, strict=True)) == {
-        (x, y) for x in range(8) for y in range(8)
-    }
+    assert set(rebuilt.coarse_templates.image_indices.tolist()) == {0, 1}
 
 
 def test_manifest_change_invalidates_cache(tmp_path: Path) -> None:
@@ -191,10 +202,11 @@ def test_manifest_change_invalidates_cache(tmp_path: Path) -> None:
         ("sift_features", 25),
         ("sift_contrast_threshold", 0.08),
         ("tile_sizes", (64,)),
+        ("coarse_template_edge", 8),
     ],
 )
 def test_feature_setting_change_invalidates_cache(
-    tmp_path: Path, setting_name: str, changed_value: int | float | tuple[int, ...]
+    tmp_path: Path, setting_name: str, changed_value: float | tuple[int, ...]
 ) -> None:
     gallery = tmp_path / "songs"
     write_textured_image(gallery / "one" / "base.jpg", 0)
@@ -235,8 +247,13 @@ def test_malformed_manifest_is_rebuilt_and_replaced(tmp_path: Path) -> None:
         "missing_array",
         "bad_offsets",
         "bad_descriptor_owner",
-        "bad_tile_owner",
-        "bad_tile_geometry",
+        "bad_coarse_owner",
+        "bad_coarse_offset",
+        "bad_coarse_dimensions",
+        "bad_coarse_dtype",
+        "bad_coarse_rank",
+        "wrong_coarse_owner_assignment",
+        "wrong_coarse_semantics",
         "wrong_image_ids",
         "wrong_cache_identity",
     ],
@@ -244,6 +261,7 @@ def test_malformed_manifest_is_rebuilt_and_replaced(tmp_path: Path) -> None:
 def test_corrupt_feature_cache_is_rebuilt(tmp_path: Path, corruption: str) -> None:
     gallery = tmp_path / "songs"
     write_textured_image(gallery / "one" / "base.jpg", 0)
+    write_textured_image(gallery / "two" / "base.jpg", 10)
     settings = Settings(gallery_dir=gallery, cache_dir=tmp_path / "cache")
     catalog = ImageCatalog.scan(gallery, settings.max_image_pixels)
     FeatureIndex.load_or_build(catalog, settings)
@@ -262,10 +280,22 @@ def test_corrupt_feature_cache_is_rebuilt(tmp_path: Path, corruption: str) -> No
             arrays["point_offsets"][-1] += 1
         elif corruption == "bad_descriptor_owner":
             arrays["descriptor_image_indices"][:] = len(catalog.records)
-        elif corruption == "bad_tile_owner":
-            arrays["tile_image_indices"][0] = len(catalog.records)
-        elif corruption == "bad_tile_geometry":
-            arrays["tile_xs"][0] = -1
+        elif corruption == "bad_coarse_owner":
+            arrays["coarse_image_indices"][0] = len(catalog.records)
+        elif corruption == "bad_coarse_offset":
+            arrays["coarse_offsets"][1] += 1
+        elif corruption == "bad_coarse_dimensions":
+            arrays["coarse_widths"][0] = 0
+        elif corruption == "bad_coarse_dtype":
+            arrays["coarse_pixels"] = arrays["coarse_pixels"].astype(np.float32)
+        elif corruption == "bad_coarse_rank":
+            arrays["coarse_region_sizes"] = arrays["coarse_region_sizes"][:, None]
+        elif corruption == "wrong_coarse_owner_assignment":
+            arrays["coarse_image_indices"][0] = 1
+        elif corruption == "wrong_coarse_semantics":
+            arrays["coarse_region_sizes"][0] = 65
+            arrays["coarse_widths"][0] = 32
+            arrays["coarse_heights"][0] = 50
         elif corruption == "wrong_image_ids":
             arrays["image_ids"][:] = "wrong-image-id"
         else:
@@ -384,21 +414,24 @@ def test_empty_catalog_round_trips_typed_empty_arrays(tmp_path: Path) -> None:
     assert built.descriptors.dtype == np.float32
     assert built.descriptor_image_indices.shape == (0,)
     assert built.descriptor_image_indices.dtype == np.int32
-    assert built.tiles.hashes.dtype == np.uint64
-    assert built.tiles.image_indices.dtype == np.int32
-    assert built.tiles.xs.dtype == np.int32
-    assert built.tiles.ys.dtype == np.int32
-    assert built.tiles.sizes.dtype == np.int32
+    assert built.coarse_templates.pixels.dtype == np.uint8
+    assert built.coarse_templates.offsets.dtype == np.int64
+    assert built.coarse_templates.widths.dtype == np.int32
+    assert built.coarse_templates.heights.dtype == np.int32
+    assert built.coarse_templates.image_indices.dtype == np.int32
+    assert built.coarse_templates.region_sizes.dtype == np.int32
+    assert built.coarse_templates.offsets.tolist() == [0]
     assert all(
         array.shape == (0,)
         for array in (
-            loaded.tiles.hashes,
-            loaded.tiles.image_indices,
-            loaded.tiles.xs,
-            loaded.tiles.ys,
-            loaded.tiles.sizes,
+            loaded.coarse_templates.pixels,
+            loaded.coarse_templates.widths,
+            loaded.coarse_templates.heights,
+            loaded.coarse_templates.image_indices,
+            loaded.coarse_templates.region_sizes,
         )
     )
+    assert loaded.coarse_templates.offsets.tolist() == [0]
     assert loaded.loaded_from_cache is True
 
 

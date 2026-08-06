@@ -1,36 +1,32 @@
 # Image Crop Matcher
 
 Image Crop Matcher is a local FastAPI application that finds the source image for a resized
-square crop. It uses SIFT, geometric verification, local appearance scoring, and a perceptual-hash
-fallback. It does not use neural models or remote recognition services.
+square crop. SIFT with geometric verification is the primary matching path. When SIFT evidence is
+insufficient, or when a query is smaller than the practical 64-pixel feature boundary,
+low-resolution coarse grayscale normalized cross-correlation (NCC) retrieves candidates for full
+grayscale and gradient template refinement. The application does not use neural models or remote
+recognition services.
 
 ## Windows Setup
 
-Run these commands from the repository root in Command Prompt:
+Install uv, then run these commands from the repository root in Command Prompt or PowerShell:
 
 ```bat
-python -m venv .venv
-.venv\Scripts\activate
-python -m pip install -e ".[dev]"
-uvicorn crop_matcher.main:app --host 127.0.0.1 --port 8000
+uv sync --extra dev
+uv run uvicorn crop_matcher.main:app --host 127.0.0.1 --port 8000
 ```
 
-For PowerShell, activate the same environment with:
-
-```powershell
-.\.venv\Scripts\Activate.ps1
-```
-
-Then open <http://127.0.0.1:8000>. Keep the terminal open while using the application. Run tests
-and the accepted full benchmark from an activated environment with:
+Then open <http://127.0.0.1:8000>. Keep the terminal open while using the application. Run tests,
+lint checks, formatting checks, and the example regression through uv with:
 
 ```bat
-pytest -v
-python benchmarks/benchmark.py --gallery songs --samples-per-image 4
+uv run pytest -v
+uv run ruff check .
+uv run ruff format --check .
+uv run benchmarks/example_regression.py --gallery songs --examples examples
 ```
 
-On macOS or Linux, the Python commands are unchanged; activate with
-`source .venv/bin/activate` instead.
+The same uv commands work on macOS and Linux; no environment activation is required.
 
 ## Gallery And Startup
 
@@ -39,17 +35,18 @@ in the web interface. The recursive scan supports `.jpg`, `.jpeg`, `.png`, `.web
 files, case-insensitively. Files whose stem ends in `_256` are treated as generated thumbnails and
 excluded.
 
-The first use of a gallery scans and decodes it, then stores catalog metadata and
-SIFT/perceptual-hash arrays in a per-gallery namespace below `.cache/galleries/`. The namespace is
-derived from the gallery's resolved absolute path, so two galleries never overwrite each other's
-cache. Later uses compare file paths, sizes, and modification times before restoring cached
-dimensions and feature arrays; source image contents are not read again while that gallery is
-unchanged. The in-memory FLANN search tree is still rebuilt from the cached descriptors.
+The first use of a gallery scans and decodes it, then stores catalog metadata, SIFT descriptors,
+and coarse grayscale template arrays in a per-gallery namespace below `.cache/galleries/`. The
+namespace is derived from the gallery's resolved absolute path, so two galleries never overwrite
+each other's cache. Later uses compare file paths, sizes, and modification times before restoring
+cached dimensions and feature arrays; source image contents are not read again while that gallery
+is unchanged. The in-memory FLANN search tree is still rebuilt from the cached descriptors.
 `GET /api/status` reports `building`, `ready`, or `error`, the indexed image count and build time,
 and active/pending gallery paths.
 
-After upgrading from an older cache schema, the next startup performs one full rebuild. Subsequent
-starts use the new catalog and feature caches normally.
+Cache schema changes are detected automatically. After upgrading from an older schema, the next
+startup performs one full rebuild; subsequent starts use the new catalog and feature caches
+normally.
 
 After a successful runtime switch, the selected absolute path is saved in `.crop-matcher.json` and
 used on the next startup. This local state file is ignored by Git and is not written when indexing
@@ -76,7 +73,7 @@ decoded dimensions are limited to 25 megapixels.
 The service returns up to three distinct sources in descending rank because a valid query is
 expected to come from the gallery. Smaller galleries return fewer results. It does not use a
 rejection threshold. `similarity` is a bounded 0-100 ranking-confidence score, not a probability.
-Perceptual-hash fallback scores are capped at 89.9 to indicate weaker geometric evidence. Identical
+Template-refinement scores are capped at 89.9 to indicate weaker geometric evidence. Identical
 source regions and nearly featureless crops are inherently ambiguous, so the highest-ranked result
 may not be the intended source in those cases.
 
@@ -116,19 +113,20 @@ however, so repeated runs can have small prediction variations even though the c
 are identical. Do not expect byte-identical failure sets across OpenCV builds or machines.
 
 The command builds one catalog, index, and matcher, performs one untimed warm-up, and reports Top-1
-accuracy, SIFT/pHash usage, and matcher-only P50/P95 latency.
+accuracy, SIFT/template usage, and matcher-only P50/P95 latency.
 
 Start with a bounded smoke run before the complete 796-image run:
 
 ```bat
-python benchmarks/benchmark.py --gallery songs --samples-per-image 1 --max-images 8
-python benchmarks/benchmark.py --gallery songs --samples-per-image 4 --seed 20260730
+uv run benchmarks/benchmark.py --gallery songs --samples-per-image 1 --max-images 8
+uv run benchmarks/benchmark.py --gallery songs --samples-per-image 4 --seed 20260730
 ```
 
-### Accepted Initial Baseline
+### Previous pHash Baseline
 
-The measured full 796-image baseline is an **accepted initial limitation**, not a passing 95%
-result:
+The following 73.02% result is retained as the previous pHash baseline. It is not a measurement of
+the current template-retrieval implementation and was an **accepted initial limitation**, not a
+passing 95% result:
 
 ```text
 images=796 queries=3184
@@ -137,10 +135,24 @@ method_sift=2586 method_phash=598
 latency_ms_p50=49.436 latency_ms_p95=305.458
 ```
 
-This run recorded 2,325/3,184 correct matches and 859 failures, producing one incorrect-result file
-per failure. Its expected process status is `1` because 73.02% is below the still-aspirational 95%
-threshold. Initial delivery accepts this measured limitation while retaining the nonzero status so
-automation cannot mistake it for a 95% acceptance pass.
+That previous run recorded 2,325/3,184 correct matches and 859 failures, producing one
+incorrect-result file per failure.
+
+### Current Template-Retrieval Baseline
+
+The full uv benchmark on the same 796-image gallery improved Top-1 accuracy by 3.30 percentage
+points while keeping matcher P95 below one second:
+
+```text
+images=796 queries=3184
+top1=2430/3184 accuracy=76.32%
+method_sift=2588 method_template=596
+latency_ms_p50=49.300 latency_ms_p95=708.004
+```
+
+The five supplied 57x57 grayscale regression examples all matched their expected source; their
+measured P95 was 712.299 ms. The coarse template arrays occupy 32.24 MiB for this gallery. The full
+benchmark still exits with status `1` because 76.32% remains below the aspirational 95% threshold.
 
 Available options are `--gallery`, `--samples-per-image`, `--max-images`, `--seed`, and
 `--failure-dir`. A bounded `--max-images` run stores and reuses its index under a deterministic

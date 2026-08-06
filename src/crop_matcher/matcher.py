@@ -11,7 +11,6 @@ from crop_matcher.feature_index import FeatureIndex
 from crop_matcher.imaging import (
     gradient_magnitude,
     normalized_correlation,
-    perceptual_hash,
     read_image,
     resize_to_max,
     to_gray,
@@ -78,11 +77,16 @@ class ImageMatcher:
         )
         target_count = min(limit, len(self.catalog.records))
         merged = {result.record.image_id: result for result in primary}
-        if len(merged) < target_count:
-            for result in self._fallback_results(
-                query_gray, set(merged), target_count - len(merged)
-            ):
-                merged.setdefault(result.record.image_id, result)
+        tiny_query = bool(self.settings.tile_sizes) and min(query_gray.shape[:2]) < min(
+            self.settings.tile_sizes
+        )
+        if (tiny_query and target_count > 0) or len(merged) < target_count:
+            exclude_ids = set() if tiny_query else set(merged)
+            requested_count = target_count if tiny_query else target_count - len(merged)
+            for result in self._fallback_results(query_gray, exclude_ids, requested_count):
+                existing = merged.get(result.record.image_id)
+                if existing is None or result.similarity > existing.similarity:
+                    merged[result.record.image_id] = result
         return sorted(
             merged.values(),
             key=lambda result: (-result.similarity, result.record.image_id),
@@ -313,42 +317,14 @@ class ImageMatcher:
         exclude_ids: set[str],
         requested_count: int = 0,
     ) -> list[MatchResult]:
-        if not self.catalog.records or not self.index.image_ids or not len(self.index.tiles.hashes):
+        if (
+            not self.catalog.records
+            or not self.index.image_ids
+            or not len(self.index.coarse_templates.pixels)
+        ):
             raise _NoMatchEvidenceError("Fallback index is empty")
 
-        query_hash = perceptual_hash(query_gray)
-        xor = np.bitwise_xor(self.index.tiles.hashes, query_hash)
-        distances = np.fromiter(
-            (int(value).bit_count() for value in xor),
-            dtype=np.uint8,
-            count=len(xor),
-        )
-        order = np.argsort(distances, kind="stable")
-        available_count = sum(image_id not in exclude_ids for image_id in self.index.image_ids)
-        target_count = min(max(1, self.settings.candidate_count, requested_count), available_count)
-        candidate_indices: list[int] = []
-        candidate_set: set[int] = set()
-        for tile_index in order:
-            image_index = int(self.index.tiles.image_indices[tile_index])
-            if (
-                not 0 <= image_index < len(self.index.image_ids)
-                or self.index.image_ids[image_index] in exclude_ids
-                or image_index in candidate_set
-            ):
-                continue
-            candidate_indices.append(image_index)
-            candidate_set.add(image_index)
-            if len(candidate_indices) == target_count:
-                break
-        if len(candidate_indices) < target_count:
-            candidate_indices.extend(
-                image_index
-                for image_index in range(len(self.index.image_ids))
-                if image_index not in candidate_set
-                and self.index.image_ids[image_index] not in exclude_ids
-            )
-            candidate_indices = candidate_indices[:target_count]
-
+        candidate_indices = self._coarse_candidates(query_gray, exclude_ids, requested_count)
         scored = [self._template_score(index, query_gray) for index in candidate_indices]
         ranking = sorted(
             zip(candidate_indices, scored, strict=True),
@@ -363,7 +339,7 @@ class ImageMatcher:
             MatchResult(
                 self.catalog.get(self.index.image_ids[image_index]),
                 round(min(89.9, 100.0 * (0.85 * score + 0.15 * margin)), 1),
-                "phash",
+                "template",
                 0,
                 0.0,
                 score,
@@ -371,6 +347,77 @@ class ImageMatcher:
             for image_index, score in ranking
         ]
         return sorted(results, key=lambda result: (-result.similarity, result.record.image_id))
+
+    def _coarse_candidates(
+        self, query_gray: np.ndarray, exclude_ids: set[str], requested_count: int
+    ) -> list[int]:
+        available_count = sum(image_id not in exclude_ids for image_id in self.index.image_ids)
+        target_count = min(max(1, self.settings.candidate_count, requested_count), available_count)
+        if target_count == 0:
+            return []
+
+        query_height, query_width = query_gray.shape[:2]
+        shortest_edge = min(query_height, query_width)
+        if shortest_edge <= 0:
+            return []
+        scale = self.settings.coarse_template_edge / shortest_edge
+        coarse_query = cv2.resize(
+            query_gray,
+            (max(1, round(query_width * scale)), max(1, round(query_height * scale))),
+            interpolation=cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC,
+        )
+        coarse = self.index.coarse_templates
+        scores: dict[int, float] = {}
+        level_count = len(coarse.image_indices)
+        for level_index in range(level_count):
+            if (
+                level_index >= len(coarse.widths)
+                or level_index >= len(coarse.heights)
+                or level_index + 1 >= len(coarse.offsets)
+            ):
+                continue
+            image_index = int(coarse.image_indices[level_index])
+            if (
+                not 0 <= image_index < len(self.index.image_ids)
+                or self.index.image_ids[image_index] in exclude_ids
+            ):
+                continue
+            width = int(coarse.widths[level_index])
+            height = int(coarse.heights[level_index])
+            start = int(coarse.offsets[level_index])
+            end = int(coarse.offsets[level_index + 1])
+            if (
+                width < coarse_query.shape[1]
+                or height < coarse_query.shape[0]
+                or width <= 0
+                or height <= 0
+                or start < 0
+                or end < start
+                or end > len(coarse.pixels)
+                or end - start != width * height
+            ):
+                continue
+            level = coarse.pixels[start:end].reshape(height, width)
+            score = self._coarse_template_peak(level, coarse_query)
+            if np.isfinite(score):
+                scores[image_index] = max(scores.get(image_index, 0.0), score)
+
+        ranked = sorted(scores, key=lambda index: (-scores[index], self.index.image_ids[index]))
+        ranked_set = set(ranked)
+        ranked.extend(
+            image_index
+            for image_index, image_id in enumerate(self.index.image_ids)
+            if image_index not in ranked_set and image_id not in exclude_ids
+        )
+        return ranked[:target_count]
+
+    @staticmethod
+    def _coarse_template_peak(candidate: np.ndarray, query: np.ndarray) -> float:
+        response = cv2.matchTemplate(candidate, query, cv2.TM_CCOEFF_NORMED)
+        finite = response[np.isfinite(response)]
+        if not len(finite):
+            return float("nan")
+        return float(np.clip((float(finite.max()) + 1.0) / 2.0, 0.0, 1.0))
 
     def _template_score(self, image_index: int, query_gray: np.ndarray) -> float:
         query_height, query_width = query_gray.shape[:2]
@@ -384,14 +431,9 @@ class ImageMatcher:
         )
         candidate_gray = to_gray(candidate)
         candidate_height, candidate_width = candidate_gray.shape[:2]
-        owner_mask = self.index.tiles.image_indices == image_index
-        indexed_sizes = np.unique(self.index.tiles.sizes[owner_mask])
+        owner_mask = self.index.coarse_templates.image_indices == image_index
         pyramid_sizes = sorted(
-            {int(size) for size in indexed_sizes}
-            | {
-                (int(left) + int(right)) // 2
-                for left, right in zip(indexed_sizes, indexed_sizes[1:])
-            }
+            {int(size) for size in self.index.coarse_templates.region_sizes[owner_mask]}
         )
         query_gradient = gradient_magnitude(query_gray)
         best_score = 0.0

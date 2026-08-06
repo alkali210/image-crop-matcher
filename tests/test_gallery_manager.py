@@ -1,6 +1,6 @@
+import shutil
 from collections.abc import Callable
 from pathlib import Path
-import shutil
 from threading import Event, Thread
 
 import numpy as np
@@ -8,7 +8,7 @@ import pytest
 
 from crop_matcher.catalog import CatalogManifestEntry, ImageCatalog, ImageRecord
 from crop_matcher.config import Settings
-from crop_matcher.feature_index import FeatureIndex, TileFeatures
+from crop_matcher.feature_index import CoarseTemplateFeatures, FeatureIndex
 from crop_matcher.gallery_manager import (
     GalleryBundle,
     GalleryConflictError,
@@ -40,12 +40,13 @@ def make_bundle(gallery_dir: Path, cache_dir: Path, settings: Settings) -> Galle
         {},
         np.empty((0, 128), dtype=np.float32),
         np.empty(0, dtype=np.int32),
-        TileFeatures(
-            hashes=np.empty(0, dtype=np.uint64),
+        CoarseTemplateFeatures(
+            pixels=np.empty(0, dtype=np.uint8),
+            offsets=np.zeros(1, dtype=np.int64),
+            widths=np.empty(0, dtype=np.int32),
+            heights=np.empty(0, dtype=np.int32),
             image_indices=np.empty(0, dtype=np.int32),
-            xs=np.empty(0, dtype=np.int32),
-            ys=np.empty(0, dtype=np.int32),
-            sizes=np.empty(0, dtype=np.int32),
+            region_sizes=np.empty(0, dtype=np.int32),
         ),
         loaded_from_cache=False,
     )

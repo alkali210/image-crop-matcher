@@ -1,17 +1,18 @@
+import json
+import tempfile
 from dataclasses import asdict, dataclass
 from hashlib import sha256
-import json
+from itertools import pairwise
 from pathlib import Path
-import tempfile
 
 import cv2
 import numpy as np
 
 from crop_matcher.catalog import ImageCatalog
 from crop_matcher.config import Settings
-from crop_matcher.imaging import perceptual_hash, read_image, resize_to_max, to_gray
+from crop_matcher.imaging import read_image, resize_to_max, to_gray
 
-CACHE_SCHEMA_VERSION = 4
+CACHE_SCHEMA_VERSION = 5
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,12 +25,24 @@ class ImageFeatures:
 
 
 @dataclass(frozen=True, slots=True)
-class TileFeatures:
-    hashes: np.ndarray
+class CoarseTemplateFeatures:
+    pixels: np.ndarray
+    offsets: np.ndarray
+    widths: np.ndarray
+    heights: np.ndarray
     image_indices: np.ndarray
-    xs: np.ndarray
-    ys: np.ndarray
-    sizes: np.ndarray
+    region_sizes: np.ndarray
+
+    def __post_init__(self) -> None:
+        for array in (
+            self.pixels,
+            self.offsets,
+            self.widths,
+            self.heights,
+            self.image_indices,
+            self.region_sizes,
+        ):
+            array.setflags(write=False)
 
 
 class FeatureIndex:
@@ -39,7 +52,7 @@ class FeatureIndex:
         by_image: dict[str, ImageFeatures],
         descriptors: np.ndarray,
         descriptor_image_indices: np.ndarray,
-        tiles: TileFeatures,
+        coarse_templates: CoarseTemplateFeatures,
         loaded_from_cache: bool,
     ) -> None:
         self.image_ids = image_ids
@@ -48,7 +61,14 @@ class FeatureIndex:
         self.descriptor_image_indices = np.ascontiguousarray(
             descriptor_image_indices, dtype=np.int32
         )
-        self.tiles = tiles
+        self.coarse_templates = CoarseTemplateFeatures(
+            pixels=np.ascontiguousarray(coarse_templates.pixels, dtype=np.uint8),
+            offsets=np.ascontiguousarray(coarse_templates.offsets, dtype=np.int64),
+            widths=np.ascontiguousarray(coarse_templates.widths, dtype=np.int32),
+            heights=np.ascontiguousarray(coarse_templates.heights, dtype=np.int32),
+            image_indices=np.ascontiguousarray(coarse_templates.image_indices, dtype=np.int32),
+            region_sizes=np.ascontiguousarray(coarse_templates.region_sizes, dtype=np.int32),
+        )
         self.loaded_from_cache = loaded_from_cache
         self.global_matcher = cv2.FlannBasedMatcher(
             {"algorithm": 1, "trees": 5},
@@ -72,6 +92,7 @@ class FeatureIndex:
                 "sift_features": settings.sift_features,
                 "sift_contrast_threshold": settings.sift_contrast_threshold,
                 "tile_sizes": list(settings.tile_sizes),
+                "coarse_template_edge": settings.coarse_template_edge,
             },
             "images": [asdict(entry) for entry in catalog.manifest],
         }
@@ -87,7 +108,7 @@ class FeatureIndex:
         if manifest_path.exists() and index_path.exists():
             try:
                 if json.loads(manifest_path.read_text("utf-8")) == metadata:
-                    return cls._load(index_path, expected_image_ids, cache_identity)
+                    return cls._load(index_path, expected_image_ids, cache_identity, settings)
             except Exception:
                 # Cache data is disposable; source-image build errors remain outside this block.
                 pass
@@ -106,11 +127,11 @@ class FeatureIndex:
         by_image: dict[str, ImageFeatures] = {}
         descriptor_groups: list[np.ndarray] = []
         descriptor_image_groups: list[np.ndarray] = []
-        tile_hashes: list[np.uint64] = []
-        tile_image_indices: list[int] = []
-        tile_xs: list[int] = []
-        tile_ys: list[int] = []
-        tile_sizes: list[int] = []
+        coarse_levels: list[np.ndarray] = []
+        coarse_image_indices: list[int] = []
+        coarse_region_sizes: list[int] = []
+        if settings.coarse_template_edge <= 0:
+            raise ValueError("coarse_template_edge must be positive")
 
         for image_index, record in enumerate(catalog.records):
             safe_record = catalog.get(record.image_id)
@@ -144,31 +165,20 @@ class FeatureIndex:
             descriptor_image_groups.append(np.full(len(descriptors), image_index, dtype=np.int32))
 
             height, width = gray.shape[:2]
-            first_tile_index = len(tile_hashes)
-            for size in settings.tile_sizes:
-                if size <= 0 or size > width or size > height:
-                    continue
-                stride = max(1, size // 2)
-                xs = list(range(0, width - size + 1, stride))
-                ys = list(range(0, height - size + 1, stride))
-                if xs[-1] != width - size:
-                    xs.append(width - size)
-                if ys[-1] != height - size:
-                    ys.append(height - size)
-                for y in ys:
-                    for x in xs:
-                        tile_hashes.append(perceptual_hash(gray[y : y + size, x : x + size]))
-                        tile_image_indices.append(image_index)
-                        tile_xs.append(x)
-                        tile_ys.append(y)
-                        tile_sizes.append(size)
-            if len(tile_hashes) == first_tile_index:
-                size = min(width, height)
-                tile_hashes.append(perceptual_hash(gray[:size, :size]))
-                tile_image_indices.append(image_index)
-                tile_xs.append(0)
-                tile_ys.append(0)
-                tile_sizes.append(size)
+            shorter_edge = min(width, height)
+            for region_size in cls._region_sizes(shorter_edge, settings.tile_sizes):
+                scale = settings.coarse_template_edge / region_size
+                coarse_width = max(1, round(width * scale))
+                coarse_height = max(1, round(height * scale))
+                interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC
+                level = cv2.resize(
+                    gray,
+                    (coarse_width, coarse_height),
+                    interpolation=interpolation,
+                )
+                coarse_levels.append(np.ascontiguousarray(level, dtype=np.uint8))
+                coarse_image_indices.append(image_index)
+                coarse_region_sizes.append(region_size)
 
         all_descriptors = cls._concatenate_rows(descriptor_groups, 128, np.float32)
         if descriptor_image_groups:
@@ -183,12 +193,8 @@ class FeatureIndex:
             by_image=by_image,
             descriptors=all_descriptors,
             descriptor_image_indices=descriptor_image_indices,
-            tiles=TileFeatures(
-                hashes=np.asarray(tile_hashes, dtype=np.uint64),
-                image_indices=np.asarray(tile_image_indices, dtype=np.int32),
-                xs=np.asarray(tile_xs, dtype=np.int32),
-                ys=np.asarray(tile_ys, dtype=np.int32),
-                sizes=np.asarray(tile_sizes, dtype=np.int32),
+            coarse_templates=cls._coarse_templates(
+                coarse_levels, coarse_image_indices, coarse_region_sizes
             ),
             loaded_from_cache=False,
         )
@@ -222,11 +228,12 @@ class FeatureIndex:
                 dtype=np.float64,
             ),
             "descriptor_image_indices": self.descriptor_image_indices,
-            "tile_hashes": self.tiles.hashes,
-            "tile_image_indices": self.tiles.image_indices,
-            "tile_xs": self.tiles.xs,
-            "tile_ys": self.tiles.ys,
-            "tile_sizes": self.tiles.sizes,
+            "coarse_pixels": self.coarse_templates.pixels,
+            "coarse_offsets": self.coarse_templates.offsets,
+            "coarse_widths": self.coarse_templates.widths,
+            "coarse_heights": self.coarse_templates.heights,
+            "coarse_image_indices": self.coarse_templates.image_indices,
+            "coarse_region_sizes": self.coarse_templates.region_sizes,
         }
         temporary_path: Path | None = None
         try:
@@ -268,6 +275,7 @@ class FeatureIndex:
         index_path: Path,
         expected_image_ids: tuple[str, ...],
         expected_cache_identity: str,
+        settings: Settings,
     ) -> "FeatureIndex":
         with np.load(index_path, allow_pickle=False) as cache:
             arrays = {
@@ -283,14 +291,15 @@ class FeatureIndex:
                     "working_heights",
                     "working_scales",
                     "descriptor_image_indices",
-                    "tile_hashes",
-                    "tile_image_indices",
-                    "tile_xs",
-                    "tile_ys",
-                    "tile_sizes",
+                    "coarse_pixels",
+                    "coarse_offsets",
+                    "coarse_widths",
+                    "coarse_heights",
+                    "coarse_image_indices",
+                    "coarse_region_sizes",
                 )
             }
-        cls._validate_archive(arrays, expected_image_ids, expected_cache_identity)
+        cls._validate_archive(arrays, expected_image_ids, expected_cache_identity, settings)
 
         image_ids = tuple(str(image_id) for image_id in arrays["image_ids"])
         points = arrays["points"]
@@ -301,12 +310,13 @@ class FeatureIndex:
         working_heights = arrays["working_heights"]
         working_scales = arrays["working_scales"]
         descriptor_image_indices = arrays["descriptor_image_indices"]
-        tiles = TileFeatures(
-            hashes=np.ascontiguousarray(arrays["tile_hashes"]),
-            image_indices=np.ascontiguousarray(arrays["tile_image_indices"]),
-            xs=np.ascontiguousarray(arrays["tile_xs"]),
-            ys=np.ascontiguousarray(arrays["tile_ys"]),
-            sizes=np.ascontiguousarray(arrays["tile_sizes"]),
+        coarse_templates = CoarseTemplateFeatures(
+            pixels=np.ascontiguousarray(arrays["coarse_pixels"]),
+            offsets=np.ascontiguousarray(arrays["coarse_offsets"]),
+            widths=np.ascontiguousarray(arrays["coarse_widths"]),
+            heights=np.ascontiguousarray(arrays["coarse_heights"]),
+            image_indices=np.ascontiguousarray(arrays["coarse_image_indices"]),
+            region_sizes=np.ascontiguousarray(arrays["coarse_region_sizes"]),
         )
 
         by_image: dict[str, ImageFeatures] = {}
@@ -328,7 +338,7 @@ class FeatureIndex:
             by_image=by_image,
             descriptors=descriptors,
             descriptor_image_indices=descriptor_image_indices,
-            tiles=tiles,
+            coarse_templates=coarse_templates,
             loaded_from_cache=True,
         )
 
@@ -337,6 +347,7 @@ class FeatureIndex:
         arrays: dict[str, np.ndarray],
         expected_image_ids: tuple[str, ...],
         expected_cache_identity: str,
+        settings: Settings,
     ) -> None:
         expected_dtypes = {
             "points": np.dtype(np.float32),
@@ -347,11 +358,12 @@ class FeatureIndex:
             "working_heights": np.dtype(np.int32),
             "working_scales": np.dtype(np.float64),
             "descriptor_image_indices": np.dtype(np.int32),
-            "tile_hashes": np.dtype(np.uint64),
-            "tile_image_indices": np.dtype(np.int32),
-            "tile_xs": np.dtype(np.int32),
-            "tile_ys": np.dtype(np.int32),
-            "tile_sizes": np.dtype(np.int32),
+            "coarse_pixels": np.dtype(np.uint8),
+            "coarse_offsets": np.dtype(np.int64),
+            "coarse_widths": np.dtype(np.int32),
+            "coarse_heights": np.dtype(np.int32),
+            "coarse_image_indices": np.dtype(np.int32),
+            "coarse_region_sizes": np.dtype(np.int32),
         }
         cache_identity = arrays["cache_identity"]
         if (
@@ -370,7 +382,7 @@ class FeatureIndex:
         metadata_names = ("working_widths", "working_heights", "working_scales")
         if any(arrays[name].shape != (image_count,) for name in metadata_names):
             raise ValueError("Invalid cached per-image metadata")
-        if len(set(str(image_id) for image_id in arrays["image_ids"])) != image_count:
+        if len({str(image_id) for image_id in arrays["image_ids"]}) != image_count:
             raise ValueError("Duplicate cached image IDs")
         if tuple(str(image_id) for image_id in arrays["image_ids"]) != expected_image_ids:
             raise ValueError("Cached image IDs do not match the catalog")
@@ -412,29 +424,88 @@ class FeatureIndex:
         if not np.array_equal(descriptor_owners, expected_owners):
             raise ValueError("Cached descriptor owners do not match offsets")
 
-        tile_names = ("tile_hashes", "tile_image_indices", "tile_xs", "tile_ys", "tile_sizes")
-        if any(arrays[name].ndim != 1 for name in tile_names):
-            raise ValueError("Invalid cached tile arrays")
-        tile_count = len(arrays["tile_hashes"])
-        if any(len(arrays[name]) != tile_count for name in tile_names[1:]):
-            raise ValueError("Cached tile array lengths differ")
-        tile_owners = arrays["tile_image_indices"]
-        if len(tile_owners) and (tile_owners.min() < 0 or tile_owners.max() >= image_count):
-            raise ValueError("Cached tile owner is out of range")
-        if not np.array_equal(np.unique(tile_owners), np.arange(image_count, dtype=np.int32)):
-            raise ValueError("Cached tiles do not cover every image")
-        tile_xs = arrays["tile_xs"].astype(np.int64)
-        tile_ys = arrays["tile_ys"].astype(np.int64)
-        tile_sizes = arrays["tile_sizes"].astype(np.int64)
-        if np.any(tile_xs < 0) or np.any(tile_ys < 0) or np.any(tile_sizes <= 0):
-            raise ValueError("Invalid cached tile geometry")
-        if len(tile_owners):
-            tile_widths = arrays["working_widths"][tile_owners]
-            tile_heights = arrays["working_heights"][tile_owners]
-            if np.any(tile_xs + tile_sizes > tile_widths) or np.any(
-                tile_ys + tile_sizes > tile_heights
-            ):
-                raise ValueError("Cached tile geometry is out of bounds")
+        coarse_names = (
+            "coarse_pixels",
+            "coarse_offsets",
+            "coarse_widths",
+            "coarse_heights",
+            "coarse_image_indices",
+            "coarse_region_sizes",
+        )
+        if any(arrays[name].ndim != 1 for name in coarse_names):
+            raise ValueError("Invalid cached coarse template arrays")
+        level_count = len(arrays["coarse_widths"])
+        if any(
+            len(arrays[name]) != level_count
+            for name in (
+                "coarse_heights",
+                "coarse_image_indices",
+                "coarse_region_sizes",
+            )
+        ):
+            raise ValueError("Cached coarse template array lengths differ")
+        coarse_offsets = arrays["coarse_offsets"]
+        if (
+            coarse_offsets.shape != (level_count + 1,)
+            or coarse_offsets[0] != 0
+            or np.any(np.diff(coarse_offsets) < 0)
+            or coarse_offsets[-1] != len(arrays["coarse_pixels"])
+        ):
+            raise ValueError("Invalid cached coarse template offsets")
+        coarse_widths = arrays["coarse_widths"].astype(np.int64)
+        coarse_heights = arrays["coarse_heights"].astype(np.int64)
+        coarse_region_sizes = arrays["coarse_region_sizes"]
+        if (
+            np.any(coarse_widths <= 0)
+            or np.any(coarse_heights <= 0)
+            or np.any(coarse_region_sizes <= 0)
+        ):
+            raise ValueError("Invalid cached coarse template dimensions")
+        if not np.array_equal(np.diff(coarse_offsets), coarse_widths * coarse_heights):
+            raise ValueError("Cached coarse template spans do not match dimensions")
+        coarse_owners = arrays["coarse_image_indices"]
+        if len(coarse_owners) and (coarse_owners.min() < 0 or coarse_owners.max() >= image_count):
+            raise ValueError("Cached coarse template owner is out of range")
+        if not np.array_equal(np.unique(coarse_owners), np.arange(image_count, dtype=np.int32)):
+            raise ValueError("Cached coarse templates do not cover every image")
+
+        expected_owners: list[int] = []
+        expected_region_sizes: list[int] = []
+        expected_widths: list[int] = []
+        expected_heights: list[int] = []
+        for image_index, (working_width, working_height) in enumerate(
+            zip(arrays["working_widths"], arrays["working_heights"], strict=True)
+        ):
+            width = int(working_width)
+            height = int(working_height)
+            for region_size in FeatureIndex._region_sizes(min(width, height), settings.tile_sizes):
+                scale = settings.coarse_template_edge / region_size
+                expected_owners.append(image_index)
+                expected_region_sizes.append(region_size)
+                expected_widths.append(max(1, round(width * scale)))
+                expected_heights.append(max(1, round(height * scale)))
+        if not (
+            np.array_equal(coarse_owners, np.asarray(expected_owners, dtype=np.int32))
+            and np.array_equal(
+                arrays["coarse_region_sizes"],
+                np.asarray(expected_region_sizes, dtype=np.int32),
+            )
+            and np.array_equal(arrays["coarse_widths"], np.asarray(expected_widths, dtype=np.int32))
+            and np.array_equal(
+                arrays["coarse_heights"], np.asarray(expected_heights, dtype=np.int32)
+            )
+        ):
+            raise ValueError("Cached coarse template metadata does not match settings")
+
+    @staticmethod
+    def _region_sizes(shorter_edge: int, tile_sizes: tuple[int, ...]) -> list[int]:
+        configured_sizes = sorted({size for size in tile_sizes if size > 0})
+        region_sizes = set(configured_sizes)
+        region_sizes.update((left + right) // 2 for left, right in pairwise(configured_sizes))
+        region_sizes = {size for size in region_sizes if size <= shorter_edge}
+        if not region_sizes:
+            region_sizes.add(shorter_edge)
+        return sorted(region_sizes)
 
     @staticmethod
     def _concatenate_rows(groups: list[np.ndarray], width: int, dtype: np.dtype) -> np.ndarray:
@@ -450,11 +521,26 @@ class FeatureIndex:
         return offsets
 
     @staticmethod
-    def _empty_tiles() -> TileFeatures:
-        return TileFeatures(
-            hashes=np.empty(0, dtype=np.uint64),
-            image_indices=np.empty(0, dtype=np.int32),
-            xs=np.empty(0, dtype=np.int32),
-            ys=np.empty(0, dtype=np.int32),
-            sizes=np.empty(0, dtype=np.int32),
+    def _coarse_templates(
+        levels: list[np.ndarray], image_indices: list[int], region_sizes: list[int]
+    ) -> CoarseTemplateFeatures:
+        return CoarseTemplateFeatures(
+            pixels=np.ascontiguousarray(
+                np.concatenate([level.reshape(-1) for level in levels])
+                if levels
+                else np.empty(0, dtype=np.uint8),
+                dtype=np.uint8,
+            ),
+            offsets=FeatureIndex._pixel_offsets(levels),
+            widths=np.asarray([level.shape[1] for level in levels], dtype=np.int32),
+            heights=np.asarray([level.shape[0] for level in levels], dtype=np.int32),
+            image_indices=np.asarray(image_indices, dtype=np.int32),
+            region_sizes=np.asarray(region_sizes, dtype=np.int32),
         )
+
+    @staticmethod
+    def _pixel_offsets(levels: list[np.ndarray]) -> np.ndarray:
+        offsets = np.empty(len(levels) + 1, dtype=np.int64)
+        offsets[0] = 0
+        np.cumsum([level.size for level in levels], out=offsets[1:])
+        return offsets

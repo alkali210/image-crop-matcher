@@ -163,7 +163,7 @@ def test_match_image_url_keeps_gallery_identity_across_atomic_swap(
             match_started.set()
             assert match_released.wait(timeout=5)
             record = active.catalog.records[0]
-            return [MatchResult(record, 90.0, "phash", 0, 0.0, 0.9)]
+            return [MatchResult(record, 90.0, "template", 0, 0.0, 0.9)]
 
         monkeypatch.setattr(active.matcher, "match_many", blocked_match)
         responses: list[Any] = []
@@ -220,8 +220,8 @@ def test_match_returns_three_ranked_distinct_results(
         by_parent = {record.parent_name: record for record in active.catalog.records}
         ranked = [
             MatchResult(by_parent["song-2"], 90.0, "sift", 4, 1.0, 0.9),
-            MatchResult(by_parent["song-0"], 80.0, "phash", 0, 0.0, 0.8),
-            MatchResult(by_parent["song-1"], 70.0, "phash", 0, 0.0, 0.7),
+            MatchResult(by_parent["song-0"], 80.0, "template", 0, 0.0, 0.8),
+            MatchResult(by_parent["song-1"], 70.0, "template", 0, 0.0, 0.7),
         ]
         monkeypatch.setattr(active.matcher, "match_many", lambda _query, limit: ranked[:limit])
 
