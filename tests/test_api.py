@@ -598,6 +598,15 @@ def test_root_serves_functional_static_shell(tmp_path: Path) -> None:
         assert '<label class="visually-hidden" for="file-input">' in response.text
         assert 'class="brand" href="/" aria-label=' not in response.text
         assert '<link rel="icon" href="data:,">' in response.text
+        assert '<meta name="color-scheme" content="light dark">' in response.text
+        assert 'id="theme-toggle"' in response.text
+        assert 'role="switch"' in response.text
+        assert 'aria-checked="false"' in response.text
+        assert 'aria-label="深色模式"' in response.text
+        assert 'focusable="false"' in response.text
+        assert 'class="theme-toggle-thumb"' in response.text
+        assert 'class="theme-toggle-icon"' in response.text
+        assert "<span>深色模式</span>" not in response.text
         assert "Find the frame" not in response.text
         assert "几何内点稳定" not in response.text
         assert client.get("/static/styles.css").status_code == 200
@@ -610,6 +619,9 @@ def test_webui_keeps_upload_controls_beside_results(tmp_path: Path) -> None:
 
     assert '<main id="search-workspace" class="search-workspace">' in html
     assert 'id="upload-view"' in html
+    assert '<section id="upload-view" class="upload-view" aria-label="图片上传">' in html
+    assert 'aria-label="上传裁切图：拖放到此处，或选择本地图片；选择图片"' in html
+    assert 'id="upload-heading"' not in html
     assert 'id="results-view"' in html
     assert 'id="results-empty"' in html
     assert 'id="reupload-button"' not in html
@@ -1218,6 +1230,105 @@ async function flushUpload() {
   console.error(error.stack || error);
   process.exitCode = 1;
 });
+"""
+
+    subprocess.run(
+        ["node", "-e", harness, str(app_script)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_frontend_theme_follows_browser_until_page_override() -> None:
+    app_script = Path(__file__).parents[1] / "src" / "crop_matcher" / "static" / "app.js"
+    harness = r"""
+const fs = require("fs");
+const vm = require("vm");
+
+class Element {
+  constructor() {
+    this.attrs = new Map();
+    this.dataset = {};
+    this.disabled = false;
+    this.hidden = true;
+    this.listeners = {};
+  }
+  addEventListener(name, callback) { this.listeners[name] = callback; }
+  getAttribute(name) { return this.attrs.has(name) ? this.attrs.get(name) : null; }
+  setAttribute(name, value) { this.attrs.set(name, String(value)); }
+}
+
+const selectors = [
+  "#theme-toggle", "#drop-zone", "#file-input", "#index-status", "#status-text",
+  "#loading-status", "#error-message", "#results-heading", "#query-summary",
+  "#query-preview", "#query-name", "#query-meta", "#result-list", "#results-empty",
+  "#current-gallery-path", "#gallery-switch-form", "#gallery-path",
+  "#switch-gallery-button", "#gallery-switch-status",
+];
+const elements = new Map(selectors.map((selector) => [selector, new Element()]));
+elements.get("#drop-zone").setAttribute("aria-disabled", "true");
+elements.get("#loading-status").hidden = true;
+
+const media = {
+  matches: true,
+  listeners: {},
+  addListener(callback) { this.listeners.change = callback; },
+};
+const documentElement = { dataset: {} };
+const windowObject = {
+  addEventListener() {},
+  clearTimeout() {},
+  location: { origin: "http://testserver" },
+  matchMedia(query) {
+    if (query !== "(prefers-color-scheme: dark)") {
+      throw new Error(`unexpected media query: ${query}`);
+    }
+    return media;
+  },
+  setTimeout() { return 1; },
+};
+const context = {
+  console,
+  document: {
+    createElement() { return new Element(); },
+    createTextNode(text) { return { textContent: text }; },
+    documentElement,
+    querySelector(selector) { return elements.get(selector); },
+  },
+  FormData: class { append() {} },
+  URL,
+  window: windowObject,
+};
+vm.createContext(context);
+vm.runInContext(fs.readFileSync(process.argv[1], "utf8"), context);
+
+const toggle = elements.get("#theme-toggle");
+if (toggle.getAttribute("aria-checked") !== "true") {
+  throw new Error("dark browser preference was not reflected");
+}
+
+media.matches = false;
+media.listeners.change();
+if (toggle.getAttribute("aria-checked") !== "false" || documentElement.dataset.theme) {
+  throw new Error("browser preference change did not update the default theme");
+}
+
+toggle.listeners.click();
+if (documentElement.dataset.theme !== "dark" || toggle.getAttribute("aria-checked") !== "true") {
+  throw new Error("manual theme override did not switch to dark");
+}
+
+media.matches = false;
+media.listeners.change();
+if (documentElement.dataset.theme !== "dark" || toggle.getAttribute("aria-checked") !== "true") {
+  throw new Error("browser preference replaced the page-level override");
+}
+
+toggle.listeners.click();
+if (documentElement.dataset.theme !== "light" || toggle.getAttribute("aria-checked") !== "false") {
+  throw new Error("second manual toggle did not switch to light");
+}
 """
 
     subprocess.run(

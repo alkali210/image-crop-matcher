@@ -15,6 +15,9 @@ const state = {
   hasActiveGallery: false,
 };
 
+const themeToggle = document.querySelector("#theme-toggle");
+const browserTheme = window.matchMedia?.("(prefers-color-scheme: dark)");
+
 const dropZone = document.querySelector("#drop-zone");
 const fileInput = document.querySelector("#file-input");
 const indexStatus = document.querySelector("#index-status");
@@ -33,6 +36,31 @@ const gallerySwitchForm = document.querySelector("#gallery-switch-form");
 const galleryPath = document.querySelector("#gallery-path");
 const switchGalleryButton = document.querySelector("#switch-gallery-button");
 const gallerySwitchStatus = document.querySelector("#gallery-switch-status");
+
+function currentThemeIsDark() {
+  const override = document.documentElement.dataset.theme;
+  return override ? override === "dark" : browserTheme?.matches === true;
+}
+
+function renderThemeToggle() {
+  themeToggle?.setAttribute("aria-checked", String(currentThemeIsDark()));
+  document.documentElement.dataset.themeReady = "";
+}
+
+function toggleTheme() {
+  document.documentElement.dataset.theme = currentThemeIsDark() ? "light" : "dark";
+  renderThemeToggle();
+}
+
+if (themeToggle) {
+  renderThemeToggle();
+  themeToggle.addEventListener("click", toggleTheme);
+  if (typeof browserTheme?.addEventListener === "function") {
+    browserTheme.addEventListener("change", renderThemeToggle);
+  } else {
+    browserTheme?.addListener?.(renderThemeToggle);
+  }
+}
 
 function setUploadEnabled(enabled) {
   const canUpload = enabled && loadingStatus.hidden;

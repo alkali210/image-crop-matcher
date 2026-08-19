@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="color-scheme" content="dark">
+    <meta name="color-scheme" content="light dark">
     <meta name="description" content="在本地图库中查找裁切图片对应的原图">
     <link rel="icon" href="data:,">
     <title>图像裁切匹配</title>
@@ -18,10 +18,28 @@
           <small>本地图库</small>
         </span>
       </a>
+      <button
+        id="theme-toggle"
+        class="theme-toggle"
+        type="button"
+        role="switch"
+        aria-checked="false"
+        aria-label="深色模式"
+      >
+        <span class="theme-toggle-thumb" aria-hidden="true">
+          <svg class="theme-toggle-icon" viewBox="0 0 24 24" focusable="false">
+            <g class="theme-toggle-sun">
+              <circle cx="12" cy="12" r="4"></circle>
+              <path d="M12 2v2M12 20v2M4.93 4.93l1.42 1.42M17.65 17.65l1.42 1.42M2 12h2M20 12h2M4.93 19.07l1.42-1.42M17.65 6.35l1.42-1.42"></path>
+            </g>
+            <path class="theme-toggle-moon" d="M20.4 15.2A8.5 8.5 0 0 1 8.8 3.6a8.5 8.5 0 1 0 11.6 11.6Z"></path>
+          </svg>
+        </span>
+      </button>
     </header>
 
     <main id="search-workspace" class="search-workspace">
-      <section id="upload-view" class="upload-view" aria-labelledby="upload-heading">
+      <section id="upload-view" class="upload-view" aria-label="图片上传">
         <div class="index-status" id="index-status" role="status" aria-live="polite" data-state="building">
           <span class="status-dot" aria-hidden="true"></span>
           <span id="status-text">正在读取索引状态...</span>
@@ -56,13 +74,13 @@
             id="drop-zone"
             class="drop-zone"
             role="button"
+            aria-label="上传裁切图：拖放到此处，或选择本地图片；选择图片"
             tabindex="0"
             aria-disabled="true"
             aria-controls="file-input"
             aria-describedby="upload-help"
           >
             <span class="crop-frame" aria-hidden="true"></span>
-            <h1 id="upload-heading">上传一张裁切图</h1>
             <p>拖放到此处，或选择本地图片</p>
             <span class="picker-label" aria-hidden="true">选择图片</span>
           </div>
