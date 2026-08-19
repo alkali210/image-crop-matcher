@@ -20,7 +20,7 @@
       </a>
     </header>
 
-    <main>
+    <main id="search-workspace" class="search-workspace">
       <section id="upload-view" class="upload-view" aria-labelledby="upload-heading">
         <div class="index-status" id="index-status" role="status" aria-live="polite" data-state="building">
           <span class="status-dot" aria-hidden="true"></span>
@@ -77,13 +77,18 @@
         </div>
       </section>
 
-      <section id="results-view" class="results-view" aria-labelledby="results-heading" hidden>
+      <section id="results-view" class="results-view" aria-labelledby="results-heading">
         <div class="results-toolbar">
           <div>
-            <p class="eyebrow">查询完成</p>
+            <p class="eyebrow">检索结果</p>
             <h1 id="results-heading" tabindex="-1">匹配结果</h1>
           </div>
-          <button id="reupload-button" class="secondary-button" type="button">重新上传</button>
+        </div>
+
+        <div id="results-empty" class="results-empty">
+          <p class="eyebrow">等待查询</p>
+          <h2>上传一张裁切图开始检索</h2>
+          <p>匹配到的原图会显示在这里。</p>
         </div>
 
         <section id="query-summary" class="query-summary" aria-labelledby="query-heading" hidden>
@@ -95,7 +100,7 @@
           </div>
         </section>
 
-        <ol id="result-list" class="result-list" aria-label="匹配到的原图"></ol>
+        <ol id="result-list" class="result-list" aria-label="匹配到的原图" hidden></ol>
       </section>
     </main>
 

@@ -159,7 +159,7 @@ def test_match_image_url_keeps_gallery_identity_across_atomic_swap(
         match_released = Event()
 
         def blocked_match(_query: np.ndarray, limit: int) -> list[MatchResult]:
-            assert limit == 3
+            assert limit == 5
             match_started.set()
             assert match_released.wait(timeout=5)
             record = active.catalog.records[0]
@@ -202,11 +202,11 @@ def test_match_image_url_keeps_gallery_identity_across_atomic_swap(
     assert image_response.content != second_payload
 
 
-def test_match_returns_three_ranked_distinct_results(
+def test_match_returns_five_ranked_distinct_results(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     gallery = tmp_path / "songs"
-    for seed in range(3):
+    for seed in range(5):
         image = np.full((32, 32, 3), seed * 50, np.uint8)
         path = gallery / f"song-{seed}" / "base.png"
         path.parent.mkdir(parents=True)
@@ -222,6 +222,8 @@ def test_match_returns_three_ranked_distinct_results(
             MatchResult(by_parent["song-2"], 90.0, "sift", 4, 1.0, 0.9),
             MatchResult(by_parent["song-0"], 80.0, "template", 0, 0.0, 0.8),
             MatchResult(by_parent["song-1"], 70.0, "template", 0, 0.0, 0.7),
+            MatchResult(by_parent["song-3"], 60.0, "template", 0, 0.0, 0.6),
+            MatchResult(by_parent["song-4"], 50.0, "template", 0, 0.0, 0.5),
         ]
         monkeypatch.setattr(active.matcher, "match_many", lambda _query, limit: ranked[:limit])
 
@@ -232,10 +234,16 @@ def test_match_returns_three_ranked_distinct_results(
 
     assert response.status_code == 200
     matches = response.json()["matches"]
-    assert len(matches) == 3
-    assert [match["parent_name"] for match in matches] == ["song-2", "song-0", "song-1"]
-    assert len({match["image_id"] for match in matches}) == 3
-    assert [match["similarity"] for match in matches] == [90.0, 80.0, 70.0]
+    assert len(matches) == 5
+    assert [match["parent_name"] for match in matches] == [
+        "song-2",
+        "song-0",
+        "song-1",
+        "song-3",
+        "song-4",
+    ]
+    assert len({match["image_id"] for match in matches}) == 5
+    assert [match["similarity"] for match in matches] == [90.0, 80.0, 70.0, 60.0, 50.0]
 
 
 def test_image_delivery_returns_404_for_catalog_path_outside_gallery(tmp_path: Path) -> None:
@@ -552,7 +560,7 @@ def test_internal_match_error_is_generic_and_does_not_leak_paths(
         matcher = active.matcher
 
         def fail_match(_query: np.ndarray, limit: int) -> None:
-            assert limit == 3
+            assert limit == 5
             raise RuntimeError(r"failed at D:\private\songs\secret.jpg")
 
         monkeypatch.setattr(matcher, "match_many", fail_match)
@@ -594,6 +602,17 @@ def test_root_serves_functional_static_shell(tmp_path: Path) -> None:
         assert "几何内点稳定" not in response.text
         assert client.get("/static/styles.css").status_code == 200
         assert client.get("/static/app.js").status_code == 200
+
+
+def test_webui_keeps_upload_controls_beside_results(tmp_path: Path) -> None:
+    with make_client(tmp_path) as client:
+        html = client.get("/").text
+
+    assert '<main id="search-workspace" class="search-workspace">' in html
+    assert 'id="upload-view"' in html
+    assert 'id="results-view"' in html
+    assert 'id="results-empty"' in html
+    assert 'id="reupload-button"' not in html
 
 
 def test_webui_contains_runtime_gallery_controls(tmp_path: Path) -> None:
@@ -653,7 +672,7 @@ class Element {
 const selectors = [
   "#drop-zone", "#file-input", "#index-status", "#status-text", "#loading-status",
   "#error-message", "#upload-view", "#results-view", "#results-heading", "#query-summary",
-  "#query-preview", "#query-name", "#query-meta", "#result-list", "#reupload-button",
+  "#query-preview", "#query-name", "#query-meta", "#result-list", "#results-empty",
   "#current-gallery-path", "#gallery-switch-form", "#gallery-path",
   "#switch-gallery-button", "#gallery-switch-status",
 ];
@@ -781,7 +800,7 @@ class Element {
   removeAttribute(name) { this.attrs.delete(name); } replaceChildren() {}
   setAttribute(name, value) { this.attrs.set(name, String(value)); }
 }
-const selectors = ["#drop-zone", "#file-input", "#index-status", "#status-text", "#loading-status", "#error-message", "#upload-view", "#results-view", "#results-heading", "#query-summary", "#query-preview", "#query-name", "#query-meta", "#result-list", "#reupload-button", "#current-gallery-path", "#gallery-switch-form", "#gallery-path", "#switch-gallery-button", "#gallery-switch-status"];
+const selectors = ["#drop-zone", "#file-input", "#index-status", "#status-text", "#loading-status", "#error-message", "#upload-view", "#results-view", "#results-heading", "#query-summary", "#query-preview", "#query-name", "#query-meta", "#result-list", "#results-empty", "#current-gallery-path", "#gallery-switch-form", "#gallery-path", "#switch-gallery-button", "#gallery-switch-status"];
 const elements = new Map(selectors.map((selector) => [selector, new Element()]));
 elements.get("#drop-zone").setAttribute("aria-disabled", "false");
 elements.get("#loading-status").hidden = true;
@@ -831,7 +850,7 @@ class Element {
   removeAttribute(name) { this.attrs.delete(name); } replaceChildren() {}
   setAttribute(name, value) { this.attrs.set(name, String(value)); }
 }
-const selectors = ["#drop-zone", "#file-input", "#index-status", "#status-text", "#loading-status", "#error-message", "#upload-view", "#results-view", "#results-heading", "#query-summary", "#query-preview", "#query-name", "#query-meta", "#result-list", "#reupload-button", "#current-gallery-path", "#gallery-switch-form", "#gallery-path", "#switch-gallery-button", "#gallery-switch-status"];
+const selectors = ["#drop-zone", "#file-input", "#index-status", "#status-text", "#loading-status", "#error-message", "#upload-view", "#results-view", "#results-heading", "#query-summary", "#query-preview", "#query-name", "#query-meta", "#result-list", "#results-empty", "#current-gallery-path", "#gallery-switch-form", "#gallery-path", "#switch-gallery-button", "#gallery-switch-status"];
 const elements = new Map(selectors.map((selector) => [selector, new Element()]));
 elements.get("#loading-status").hidden = true; elements.get("#gallery-path").value = "C:\\new";
 let timerCallback = null;
@@ -880,7 +899,7 @@ class Element {
   removeAttribute(name) { this.attrs.delete(name); } replaceChildren() {}
   setAttribute(name, value) { this.attrs.set(name, String(value)); }
 }
-const selectors = ["#drop-zone", "#file-input", "#index-status", "#status-text", "#loading-status", "#error-message", "#upload-view", "#results-view", "#results-heading", "#query-summary", "#query-preview", "#query-name", "#query-meta", "#result-list", "#reupload-button", "#current-gallery-path", "#gallery-switch-form", "#gallery-path", "#switch-gallery-button", "#gallery-switch-status"];
+const selectors = ["#drop-zone", "#file-input", "#index-status", "#status-text", "#loading-status", "#error-message", "#upload-view", "#results-view", "#results-heading", "#query-summary", "#query-preview", "#query-name", "#query-meta", "#result-list", "#results-empty", "#current-gallery-path", "#gallery-switch-form", "#gallery-path", "#switch-gallery-button", "#gallery-switch-status"];
 const elements = new Map(selectors.map((selector) => [selector, new Element()]));
 elements.get("#loading-status").hidden = true; elements.get("#gallery-path").value = "C:\\new";
 let timerCallback = null;
@@ -981,7 +1000,7 @@ class Element {
 const selectors = [
   "#drop-zone", "#file-input", "#index-status", "#status-text", "#loading-status",
   "#error-message", "#upload-view", "#results-view", "#results-heading", "#query-summary",
-  "#query-preview", "#query-name", "#query-meta", "#result-list", "#reupload-button",
+  "#query-preview", "#query-name", "#query-meta", "#result-list", "#results-empty",
   "#current-gallery-path", "#gallery-switch-form", "#gallery-path",
   "#switch-gallery-button", "#gallery-switch-status",
 ];
@@ -1031,6 +1050,169 @@ vm.runInContext(fs.readFileSync(process.argv[1], "utf8"), context);
   }
   if (createdUrls !== 0 || revokedUrls !== 0) {
     throw new Error(`unexpected URL lifecycle: created=${createdUrls} revoked=${revokedUrls}`);
+  }
+})().catch((error) => {
+  console.error(error.stack || error);
+  process.exitCode = 1;
+});
+"""
+
+    subprocess.run(
+        ["node", "-e", harness, str(app_script)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_frontend_replaces_results_after_direct_second_upload() -> None:
+    app_script = Path(__file__).parents[1] / "src" / "crop_matcher" / "static" / "app.js"
+    harness = r"""
+const fs = require("fs");
+const vm = require("vm");
+
+class Element {
+  constructor() {
+    this.attrs = new Map();
+    this.children = [];
+    this.dataset = {};
+    this.disabled = false;
+    this.files = [];
+    this.hidden = true;
+    this.listeners = {};
+    this.textContent = "";
+    this.value = "";
+    this.replaceCount = 0;
+  }
+  addEventListener(name, callback) { this.listeners[name] = callback; }
+  append(...children) { this.children.push(...children); }
+  click() {}
+  contains() { return false; }
+  focus() {}
+  getAttribute(name) { return this.attrs.has(name) ? this.attrs.get(name) : null; }
+  removeAttribute(name) { this.attrs.delete(name); }
+  replaceChildren(...children) {
+    this.children = children;
+    this.replaceCount += 1;
+  }
+  setAttribute(name, value) { this.attrs.set(name, String(value)); }
+}
+
+const selectors = [
+  "#drop-zone", "#file-input", "#index-status", "#status-text", "#loading-status",
+  "#error-message", "#results-heading", "#query-summary", "#query-preview", "#query-name",
+  "#query-meta", "#result-list", "#results-empty", "#current-gallery-path",
+  "#gallery-switch-form", "#gallery-path", "#switch-gallery-button",
+  "#gallery-switch-status",
+];
+const elements = new Map(selectors.map((selector) => [selector, new Element()]));
+elements.get("#drop-zone").setAttribute("aria-disabled", "true");
+elements.get("#loading-status").hidden = true;
+elements.get("#results-empty").hidden = false;
+
+function match(imageId, parentName, rank) {
+  return {
+    image_id: imageId,
+    parent_name: parentName,
+    filename: `${imageId}.jpg`,
+    width: 768,
+    height: 768,
+    similarity: 100 - rank,
+    image_url: `/api/images/gallery/${imageId}`,
+  };
+}
+
+function response(prefix, parentName) {
+  return {
+    query: { width: 384, height: 384 },
+    elapsed_ms: 10,
+    matches: Array.from(
+      { length: 5 },
+      (_value, index) => match(`${prefix}-${index + 1}`, parentName, index),
+    ),
+  };
+}
+
+const responses = [response("first", "first-parent"), response("second", "second-parent")];
+let createdUrls = 0;
+let revokedUrls = 0;
+const NativeURL = URL;
+class TestURL extends NativeURL {
+  static createObjectURL() {
+    createdUrls += 1;
+    return `blob:query-${createdUrls}`;
+  }
+  static revokeObjectURL() { revokedUrls += 1; }
+}
+const windowObject = {
+  addEventListener() {},
+  clearTimeout() {},
+  location: { origin: "http://testserver" },
+  setTimeout() { return 1; },
+};
+const context = {
+  console,
+  document: {
+    createElement() { return new Element(); },
+    createTextNode(text) { return { textContent: text }; },
+    querySelector(selector) { return elements.get(selector); },
+  },
+  fetch: async () => ({ ok: true, json: async () => responses.shift() }),
+  FormData: class { append() {} },
+  URL: TestURL,
+  window: windowObject,
+};
+vm.createContext(context);
+vm.runInContext(fs.readFileSync(process.argv[1], "utf8"), context);
+
+async function flushUpload() {
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+}
+
+(async () => {
+  context.renderStatus({
+    state: "ready",
+    indexed_images: 10,
+    build_time_ms: 1,
+    error: null,
+    gallery_dir: "C:\\gallery",
+    pending_gallery_dir: null,
+    reindexing: false,
+    switch_error: null,
+  });
+
+  const fileInput = elements.get("#file-input");
+  const resultList = elements.get("#result-list");
+  fileInput.files = [{ name: "first.png", size: 100 }];
+  fileInput.listeners.change();
+  await flushUpload();
+  if (resultList.children.length !== 5 || resultList.replaceCount !== 1) {
+    throw new Error("first upload did not render exactly five replacement rows");
+  }
+
+  fileInput.files = [{ name: "second.png", size: 200 }];
+  fileInput.listeners.change();
+  await flushUpload();
+  if (resultList.children.length !== 5 || resultList.replaceCount !== 2) {
+    throw new Error(
+      `second upload appended stale results: rows=${resultList.children.length} replacements=${resultList.replaceCount}`,
+    );
+  }
+  if (elements.get("#query-name").textContent !== "second.png") {
+    throw new Error(`query summary was not replaced: ${elements.get("#query-name").textContent}`);
+  }
+  if (
+    elements.get("#drop-zone").getAttribute("aria-disabled") !== "false" ||
+    fileInput.disabled
+  ) {
+    throw new Error("uploader was not re-enabled after the second search");
+  }
+  if (createdUrls !== 2 || revokedUrls !== 1) {
+    throw new Error(`unexpected URL lifecycle: created=${createdUrls} revoked=${revokedUrls}`);
+  }
+  if (!elements.get("#results-empty").hidden || elements.get("#query-summary").hidden) {
+    throw new Error("results state did not replace the empty state");
   }
 })().catch((error) => {
   console.error(error.stack || error);

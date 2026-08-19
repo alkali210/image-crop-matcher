@@ -21,15 +21,13 @@ const indexStatus = document.querySelector("#index-status");
 const statusText = document.querySelector("#status-text");
 const loadingStatus = document.querySelector("#loading-status");
 const errorMessage = document.querySelector("#error-message");
-const uploadView = document.querySelector("#upload-view");
-const resultsView = document.querySelector("#results-view");
 const resultsHeading = document.querySelector("#results-heading");
 const querySummary = document.querySelector("#query-summary");
 const queryPreview = document.querySelector("#query-preview");
 const queryName = document.querySelector("#query-name");
 const queryMeta = document.querySelector("#query-meta");
 const resultList = document.querySelector("#result-list");
-const reuploadButton = document.querySelector("#reupload-button");
+const resultsEmpty = document.querySelector("#results-empty");
 const currentGalleryPath = document.querySelector("#current-gallery-path");
 const gallerySwitchForm = document.querySelector("#gallery-switch-form");
 const galleryPath = document.querySelector("#gallery-path");
@@ -216,7 +214,6 @@ async function pollStatus() {
 
 function setBusy(busy) {
   loadingStatus.hidden = !busy;
-  reuploadButton.disabled = busy;
   setUploadEnabled(!busy && state.hasActiveGallery);
 }
 
@@ -378,11 +375,11 @@ function renderMatches(matches) {
   resultList.replaceChildren(
     ...matches.map((match, index) => createMatchRow(match, index + 1)),
   );
+  resultList.hidden = false;
 }
 
 function showResults() {
-  uploadView.hidden = true;
-  resultsView.hidden = false;
+  resultsEmpty.hidden = true;
   resultsHeading.focus();
 }
 
@@ -490,23 +487,8 @@ function openFilePicker() {
   }
 }
 
-function resetUpload() {
-  revokeQueryUrl();
-  state.selectedFile = null;
-  queryPreview.removeAttribute("src");
-  queryName.textContent = "";
-  queryMeta.textContent = "";
-  querySummary.hidden = true;
-  resultList.replaceChildren();
-  resultsView.hidden = true;
-  uploadView.hidden = false;
-  clearError();
-  fileInput.value = "";
-  dropZone.focus();
-}
-
 function restorePage() {
-  if (state.queryUrl !== null && !resultsView.hidden) {
+  if (state.queryUrl !== null) {
     queryPreview.src = state.queryUrl;
   }
 
@@ -551,7 +533,6 @@ fileInput.addEventListener("change", () => {
   submitFile(fileInput.files[0]);
 });
 
-reuploadButton.addEventListener("click", resetUpload);
 gallerySwitchForm.addEventListener("submit", submitGallery);
 window.addEventListener("pagehide", (event) => {
   if (event.persisted) {

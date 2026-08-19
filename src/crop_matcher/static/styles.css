@@ -131,9 +131,15 @@ main {
   padding: clamp(44px, 8vh, 80px) 0 72px;
 }
 
+.search-workspace {
+  display: grid;
+  align-items: start;
+  grid-template-columns: minmax(300px, 360px) minmax(0, 1fr);
+  gap: clamp(32px, 5vw, 72px);
+}
+
 .upload-view {
-  width: min(100%, 680px);
-  margin: 0 auto;
+  width: 100%;
 }
 
 .index-status {
@@ -371,13 +377,13 @@ main {
 
 .results-view {
   width: 100%;
+  min-width: 0;
 }
 
 .results-toolbar {
   display: flex;
   min-height: 80px;
   align-items: flex-end;
-  justify-content: space-between;
   gap: 24px;
 }
 
@@ -395,6 +401,34 @@ main {
 
 .results-toolbar h1:focus {
   outline: none;
+}
+
+.results-empty {
+  display: grid;
+  min-height: 330px;
+  margin-top: 34px;
+  padding: 36px;
+  place-content: center;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  text-align: center;
+}
+
+.results-empty h2,
+.results-empty p {
+  margin: 0;
+}
+
+.results-empty h2 {
+  font-family: var(--serif);
+  font-size: clamp(1.45rem, 3vw, 2rem);
+  font-weight: 500;
+}
+
+.results-empty > p:last-child {
+  margin-top: 9px;
+  color: var(--muted);
+  font-size: 0.88rem;
 }
 
 .secondary-button,
@@ -570,6 +604,19 @@ main {
 @keyframes spin {
   to {
     transform: rotate(360deg);
+  }
+}
+
+@media (max-width: 960px) {
+  .search-workspace {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 44px;
+  }
+
+  .upload-view,
+  .results-view {
+    width: min(100%, 680px);
+    margin: 0 auto;
   }
 }
 
