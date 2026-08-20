@@ -1,173 +1,130 @@
 # Image Crop Matcher
 
-Image Crop Matcher is a local FastAPI application that finds the source image for a resized
-square crop. SIFT with geometric verification is the primary matching path. When SIFT evidence is
-insufficient, or when a query is smaller than the practical 64-pixel feature boundary,
-low-resolution coarse grayscale normalized cross-correlation (NCC) retrieves candidates for full
-grayscale and gradient template refinement. The application does not use neural models or remote
-recognition services.
+Image Crop Matcher is a local crop-retrieval tool. It finds the source image for a crop within a selected gallery using traditional computer-vision algorithms, without neural models or remote recognition services.
 
-## Windows Setup
+## Features
 
-Install uv, then run these commands from the repository root in Command Prompt or PowerShell:
+- Recursively indexes `.jpg`, `.jpeg`, `.png`, `.webp`, and `.bmp` images in a local gallery.
+- Returns up to 5 distinct source-image candidates for each uploaded crop, ranked by similarity and linked to the original files.
+- Switches gallery paths from the WebUI; a new gallery is indexed in the background while the current gallery remains available.
+- Supports repeated uploads and light/dark themes that follow the browser preference.
+- Uses `songs/` as the default gallery. Images whose filename stem ends in `_256` are treated as generated thumbnails and excluded.
+- Limits each upload to 10 MiB and each decoded image to 25 MP.
 
-```bat
-uv sync --extra dev
+The matcher is intended for regions cropped from gallery images and then resized. Rotation, mirroring, perspective transforms, borders, watermarks, and interface overlays are not supported transformations.
+
+## Usage
+
+Run the following commands from the repository root:
+
+```bash
+python -m pip install uv
+uv sync
+```
+
+Place source images under `songs/`, then start the service:
+
+```bash
 uv run uvicorn crop_matcher.main:app --host 127.0.0.1 --port 8000
 ```
 
-Then open <http://127.0.0.1:8000>. Keep the terminal open while using the application. Run tests,
-lint checks, formatting checks, and the example regression through uv with:
+Open <http://127.0.0.1:8000> in a browser. The left column accepts another existing gallery as an absolute path. A successful selection is stored in `.crop-matcher.json` and reused on the next startup.
 
-```bat
-uv run pytest -v
-uv run ruff check .
-uv run ruff format --check .
-uv run benchmarks/example_regression.py --gallery songs --examples examples
+Index caches are stored under `.cache/galleries/`. The application does not continuously watch gallery files. After adding, replacing, moving, or deleting images, restart the service or switch to another gallery and back in the WebUI.
+
+## Matching Method
+
+During indexing, the application extracts SIFT features from each image and builds a FLANN matcher and a low-resolution grayscale template pyramid. Queries use the following two matching paths.
+
+### SIFT and Geometric Verification
+
+1. Convert the query to grayscale. If its shortest edge is below 256 px, scale it proportionally to 256 px before extracting SIFT keypoints and descriptors.
+2. Use FLANN KNN with a Lowe ratio of `0.78` to vote for source-image candidates from the global descriptor index.
+3. Rematch descriptors for each candidate and estimate a partial affine transform with RANSAC. At least 4 geometric inliers are required.
+4. Warp the candidate region to the query dimensions and calculate grayscale and gradient correlations.
+
+Normalized correlations are mapped to `[0, 1]`. The primary score is:
+
+```text
+appearance           = 0.7 × gray_score + 0.3 × edge_score
+count_quality        = min(inlier_count / 20, 1)
+reprojection_quality = clip(1 - mean_reprojection_error / 4, 0, 1)
+geometry              = clip(0.5 × inlier_ratio + 0.3 × count_quality + 0.2 × reprojection_quality, 0, 1)
+raw_score             = 0.4 × geometry + 0.5 × appearance
+margin                = clip((best_score - second_score) / 0.2, 0, 1)
+similarity            = 100 × clip(raw_score + 0.1 × margin, 0, 1)
 ```
 
-The same uv commands work on macOS and Linux; no environment activation is required.
+### Template Fallback
 
-## Gallery And Startup
+The template path supplements results when SIFT evidence is insufficient, the query's shortest edge is below 64 px, or SIFT does not produce enough entries to fill the candidate list:
 
-Place source images anywhere below `songs/`, or enter another existing **absolute directory path**
-in the web interface. The recursive scan supports `.jpg`, `.jpeg`, `.png`, `.webp`, and `.bmp`
-files, case-insensitively. Files whose stem ends in `_256` are treated as generated thumbnails and
-excluded.
+1. Coarsely rank candidates with normalized cross-correlation (NCC) over the low-resolution grayscale template pyramid.
+2. Match grayscale and gradient images at multiple scales of each candidate source.
+3. Calculate the ranking score as follows:
 
-The first use of a gallery scans and decodes it, then stores catalog metadata, SIFT descriptors,
-and coarse grayscale template arrays in a per-gallery namespace below `.cache/galleries/`. The
-namespace is derived from the gallery's resolved absolute path, so two galleries never overwrite
-each other's cache. Later uses compare file paths, sizes, and modification times before restoring
-cached dimensions and feature arrays; source image contents are not read again while that gallery
-is unchanged. The in-memory FLANN search tree is still rebuilt from the cached descriptors.
-`GET /api/status` reports `building`, `ready`, or `error`, the indexed image count and build time,
-and active/pending gallery paths.
+```text
+template_score = 0.7 × gray_score + 0.3 × edge_score
+similarity     = min(89.9, 100 × (0.85 × template_score + 0.15 × margin))
+```
 
-Cache schema changes are detected automatically. After upgrading from an older schema, the next
-startup performs one full rebuild; subsequent starts use the new catalog and feature caches
-normally.
-
-After a successful runtime switch, the selected absolute path is saved in `.crop-matcher.json` and
-used on the next startup. This local state file is ignored by Git and is not written when indexing
-the replacement fails. A switch builds in the background: the previous gallery remains available
-for uploads, searches, and original-image links until the replacement is complete, then the active
-bundle is swapped atomically. A failed build rolls back to the previous gallery and displays an
-error beside the path control.
-
-The application does not watch an active gallery for file changes. To rebuild after adding,
-replacing, moving, or removing images, restart Uvicorn or switch away and back. A manifest change
-invalidates that gallery's feature cache.
-
-## Queries And Results
-
-Supported queries are square regions cropped from a gallery source, resized to a different square
-size, and optionally converted to grayscale. Rotation, mirroring, perspective changes, borders,
-watermarks, and interface overlays are not supported transforms. The practical minimum expected
-side length is 64 pixels.
-
-Uploads may use any of the five supported image formats regardless of filename or declared MIME
-type; successful OpenCV decoding determines validity. Each upload is limited to 10 MiB and its
-decoded dimensions are limited to 25 megapixels.
-
-The service returns up to three distinct sources in descending rank because a valid query is
-expected to come from the gallery. Smaller galleries return fewer results. It does not use a
-rejection threshold. `similarity` is a bounded 0-100 ranking-confidence score, not a probability.
-Template-refinement scores are capped at 89.9 to indicate weaker geometric evidence. Identical
-source regions and nearly featureless crops are inherently ambiguous, so the highest-ranked result
-may not be the intended source in those cases.
+Final results are deduplicated and sorted by descending `similarity`. The value is a ranking-confidence score, not a probability. There is no rejection threshold, so the matcher returns available gallery candidates even when evidence is weak.
 
 ## API
 
-The application exposes four API routes:
+The base URL is `http://127.0.0.1:8000`. Interactive OpenAPI documentation is available at `/docs`.
 
-- `GET /api/status` returns startup state, indexed image count, build time, active and pending paths,
-  reindexing state, and any public startup or switch error.
-- `POST /api/gallery` accepts JSON such as `{"path":"C:\\images\\gallery"}`. The path must be
-  absolute. It returns `202` while a replacement builds, `200` when that gallery is already active,
-  `400` for an invalid path, or `409` when another startup/build switch is in progress.
-- `POST /api/match` accepts one multipart field named `file` and returns query dimensions, elapsed
-  time, and up to three ranked entries in `matches`.
-- `GET /api/images/{gallery_id}/{image_id}` returns the trusted original gallery file for a
-  namespaced URL returned by the matcher. Links remain available for the active and immediately
-  previous gallery; after later successful switches, older links safely expire with `404` instead
-  of resolving against another gallery.
+| Method | Path | Description |
+| --- | --- | --- |
+| `GET` | `/api/status` | Returns index state, image count, build time, and gallery-switch state. |
+| `POST` | `/api/gallery` | Switches to a gallery identified by an absolute path. |
+| `POST` | `/api/match` | Uploads a query image and returns up to 5 candidates. |
+| `GET` | `/api/images/{gallery_id}/{image_id}` | Returns an original image referenced by a match. |
 
-Example PowerShell request:
+### Status and Gallery
+
+`GET /api/status` returns `state`, `indexed_images`, `build_time_ms`, active and pending gallery paths, `reindexing`, and error fields. `state` is `building`, `ready`, or `error`.
+
+`POST /api/gallery` accepts JSON:
+
+```json
+{"path":"C:\\images\\songs"}
+```
+
+A newly accepted background build returns `202`; an already active target returns `200`. An invalid path returns `400`. Initial indexing or another gallery switch in progress returns `409`.
+
+### Image Matching
+
+`POST /api/match` requires a multipart field named `file`:
 
 ```powershell
 curl.exe -F "file=@C:\path\to\crop.png" http://127.0.0.1:8000/api/match
 ```
 
-While the initial startup is still building, match and image requests return `503`. During a runtime
-replacement build they continue using the active gallery. Invalid images return `400`; oversized
-files or decoded images return `413`. Concurrent gallery switch requests return `409`. API errors use
-`{"error":{"code":"...","message":"..."}}`.
-
-## Benchmark
-
-The benchmark generates a deterministic crop workload with seed `20260730`: color and grayscale
-crops cover 10%-40% of each source's shorter edge and use output sizes of 64, 90, 128, or 192 pixels.
-It also seeds OpenCV's RNG when that API is available. OpenCV FLANN and RANSAC are approximate,
-however, so repeated runs can have small prediction variations even though the crop specifications
-are identical. Do not expect byte-identical failure sets across OpenCV builds or machines.
-
-The command builds one catalog, index, and matcher, performs one untimed warm-up, and reports Top-1
-accuracy, SIFT/template usage, and matcher-only P50/P95 latency.
-
-Start with a bounded smoke run before the complete 796-image run:
-
-```bat
-uv run benchmarks/benchmark.py --gallery songs --samples-per-image 1 --max-images 8
-uv run benchmarks/benchmark.py --gallery songs --samples-per-image 4 --seed 20260730
+```json
+{
+  "query": {"width": 128, "height": 128},
+  "elapsed_ms": 42,
+  "matches": [{
+    "image_id": "9656ad30b81ad6edd501eec4",
+    "parent_name": "song-name",
+    "filename": "cover.jpg",
+    "width": 768,
+    "height": 768,
+    "similarity": 97.4,
+    "image_url": "/api/images/gallery-id/9656ad30b81ad6edd501eec4"
+  }]
+}
 ```
 
-### Previous pHash Baseline
+Use `image_url` directly to display or download the corresponding source image.
 
-The following 73.02% result is retained as the previous pHash baseline. It is not a measurement of
-the current template-retrieval implementation and was an **accepted initial limitation**, not a
-passing 95% result:
+### Error Format
 
-```text
-images=796 queries=3184
-top1=2325/3184 accuracy=73.02%
-method_sift=2586 method_phash=598
-latency_ms_p50=49.436 latency_ms_p95=305.458
+API errors use the following envelope:
+
+```json
+{"error":{"code":"invalid_image","message":"..."}}
 ```
 
-That previous run recorded 2,325/3,184 correct matches and 859 failures, producing one
-incorrect-result file per failure.
-
-### Current Template-Retrieval Baseline
-
-The full uv benchmark on the same 796-image gallery improved Top-1 accuracy by 3.30 percentage
-points while keeping matcher P95 below one second:
-
-```text
-images=796 queries=3184
-top1=2430/3184 accuracy=76.32%
-method_sift=2588 method_template=596
-latency_ms_p50=49.300 latency_ms_p95=708.004
-```
-
-The five supplied 57x57 grayscale regression examples all matched their expected source; their
-measured P95 was 712.299 ms. The coarse template arrays occupy 32.24 MiB for this gallery. The full
-benchmark still exits with status `1` because 76.32% remains below the aspirational 95% threshold.
-
-Available options are `--gallery`, `--samples-per-image`, `--max-images`, `--seed`, and
-`--failure-dir`. A bounded `--max-images` run stores and reuses its index under a deterministic
-`.cache/benchmarks/bounded-<digest>/` namespace based on its bounded catalog and feature settings. It
-never reads or replaces the full-gallery manifest and arrays directly under `.cache/`.
-
-Incorrect matches are written below a deterministic `run-<digest>/` subdirectory of
-`benchmark-failures/` by default. Each run directory contains a benchmark ownership marker. At the
-start of a run, before gallery scanning or warm-up, the benchmark deletes only its own
-`failure-*.json` files directly inside that marked run directory. It does not delete matching files
-from the caller-provided root or other run directories, and it refuses to reuse an unmarked
-directory. Each failure file records source and predicted IDs, crop coordinates and side, output
-size, grayscale state, similarity, and measured latency.
-
-The command exits with status `1` only when Top-1 accuracy is below 95%. Latency is reported for
-operator comparison but never changes the process status because it depends on the machine and
-current load. Build, decode, match, and file-write errors are not hidden; they terminate the command
-with their normal nonzero error status.
+Common status codes are `400` for invalid images or paths, `409` for gallery-switch conflicts, `413` for upload or decoded-image size limits, and `503` while the index is unavailable.
