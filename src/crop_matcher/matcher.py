@@ -16,6 +16,36 @@ from crop_matcher.imaging import (
     to_gray,
 )
 
+_ALIGNMENT_SCALE_FACTORS = (
+    0.8,
+    0.85,
+    0.9,
+    0.95,
+    1.0,
+    1.05,
+    1.1,
+    1.125,
+    1.15,
+    1.2,
+)
+_ALIGNMENT_SEARCH_RADIUS = 12
+_AXIS_RANSAC_REPROJECTION_THRESHOLD = 4.0
+_AXIS_RANSAC_MAX_MODELS = 256
+_AXIS_RANSAC_MIN_BASELINE_SQUARED = 16.0
+_STRUCTURE_GRADIENT_THRESHOLD = 64.0
+_STRUCTURE_DENSITY_SATURATION = 0.35
+_GEOMETRY_WEIGHT_MIN = 0.1
+_GEOMETRY_WEIGHT_MAX = 0.35
+_GEOMETRY_COUNT_SATURATION = 12
+_GEOMETRY_SPREAD_SATURATION = 0.25
+_GEOMETRY_MIN_AXIS_SPAN = 0.02
+_EDGE_WEIGHT_MIN = 0.1
+_EDGE_WEIGHT_MAX = 0.3
+_SPARSE_TEMPLATE_REFINEMENT_RELIABILITY = 0.5
+_GEOMETRY_QUALITY_FLOOR = 0.5
+_GEOMETRY_QUALITY_RANGE = 0.4
+_MIN_TEMPLATE_REFINEMENT_COUNT = 1
+
 
 class _NoMatchEvidenceError(RuntimeError):
     pass
@@ -34,9 +64,9 @@ class MatchResult:
 @dataclass(frozen=True, slots=True)
 class CandidateScore:
     record: ImageRecord
-    geometry: float
     appearance: float
-    raw_score: float
+    geometry_quality: float
+    score: float
     inlier_count: int
     inlier_ratio: float
 
@@ -61,21 +91,22 @@ class ImageMatcher:
             raise ValueError("limit must be positive")
 
         query_gray = to_gray(query_bgr)
+        target_count = min(limit, len(self.catalog.records))
         feature_query, extraction_scale = self._feature_query(query_gray)
         with self._sift_lock:
             keypoints, descriptors = self._sift.detectAndCompute(feature_query, None)
         points = np.asarray([point.pt for point in keypoints], dtype=np.float32).reshape(-1, 2)
-        primary = (
+        primary, coarse_candidate_indices = (
             self._primary_results(
                 query_gray,
                 points,
                 descriptors,
                 extraction_scale,
+                target_count,
             )
             if descriptors is not None and len(descriptors) >= 4
-            else []
+            else ([], None)
         )
-        target_count = min(limit, len(self.catalog.records))
         merged = {result.record.image_id: result for result in primary}
         tiny_query = bool(self.settings.tile_sizes) and min(query_gray.shape[:2]) < min(
             self.settings.tile_sizes
@@ -83,7 +114,16 @@ class ImageMatcher:
         if (tiny_query and target_count > 0) or len(merged) < target_count:
             exclude_ids = set() if tiny_query else set(merged)
             requested_count = target_count if tiny_query else target_count - len(merged)
-            for result in self._fallback_results(query_gray, exclude_ids, requested_count):
+            if not tiny_query and coarse_candidate_indices is not None:
+                fallback = self._fallback_results(
+                    query_gray,
+                    exclude_ids,
+                    requested_count,
+                    coarse_candidate_indices,
+                )
+            else:
+                fallback = self._fallback_results(query_gray, exclude_ids, requested_count)
+            for result in fallback:
                 existing = merged.get(result.record.image_id)
                 if existing is None or result.similarity > existing.similarity:
                     merged[result.record.image_id] = result
@@ -98,10 +138,15 @@ class ImageMatcher:
         query_points: np.ndarray,
         query_descriptors: np.ndarray,
         extraction_scale: float,
-    ) -> list[MatchResult]:
+        target_count: int,
+    ) -> tuple[list[MatchResult], list[int] | None]:
+        query_gradient = gradient_magnitude(query_gray)
+        structure_reliability = self._query_structure_reliability(query_gradient)
+        geometry_weight = self._query_geometry_weight(query_gradient)
+        retrieved_ids = self._retrieve(query_descriptors)
         candidates = [
             score
-            for image_id in self._retrieve(query_descriptors)
+            for image_id in retrieved_ids
             if (
                 score := self._verify(
                     image_id,
@@ -109,20 +154,69 @@ class ImageMatcher:
                     query_points,
                     query_descriptors,
                     extraction_scale,
+                    query_gradient,
+                    geometry_weight,
+                    structure_reliability,
                 )
             )
             is not None
         ]
-        candidates.sort(key=lambda item: (-item.raw_score, item.record.image_id))
-        if not candidates:
-            return []
-
-        second = candidates[1].raw_score if len(candidates) > 1 else 0.0
-        margin = float(np.clip((candidates[0].raw_score - second) / 0.2, 0.0, 1.0))
+        desired_count = min(target_count, len(self.catalog.records))
+        coarse_candidate_indices: list[int] | None = None
+        if len(candidates) < desired_count:
+            candidate_ids = {candidate.record.image_id for candidate in candidates}
+            coarse_candidate_indices = self._coarse_candidates(
+                query_gray,
+                candidate_ids,
+                desired_count - len(candidates),
+            )
+            retrieved_set = set(retrieved_ids)
+            for index in coarse_candidate_indices:
+                image_id = self.index.image_ids[index]
+                if image_id in retrieved_set:
+                    continue
+                score = self._verify(
+                    image_id,
+                    query_gray,
+                    query_points,
+                    query_descriptors,
+                    extraction_scale,
+                    query_gradient,
+                    geometry_weight,
+                    structure_reliability,
+                )
+                if score is not None:
+                    candidates.append(score)
+                    if len(candidates) >= desired_count:
+                        break
+        if structure_reliability < _SPARSE_TEMPLATE_REFINEMENT_RELIABILITY:
+            image_indices = {
+                image_id: index for index, image_id in enumerate(self.index.image_ids)
+            }
+            rescored: list[CandidateScore] = []
+            for candidate in candidates:
+                template_appearance = self._template_score(
+                    image_indices[candidate.record.image_id],
+                    query_gray,
+                    query_gradient,
+                    structure_reliability,
+                )
+                if template_appearance > candidate.score:
+                    candidate = CandidateScore(
+                        candidate.record,
+                        template_appearance,
+                        candidate.geometry_quality,
+                        template_appearance,
+                        candidate.inlier_count,
+                        candidate.inlier_ratio,
+                    )
+                rescored.append(candidate)
+            candidates = rescored
+        candidates.sort(key=lambda item: (-item.score, item.record.image_id))
         results = [
             MatchResult(
                 candidate.record,
-                round(100.0 * float(np.clip(candidate.raw_score + 0.1 * margin, 0.0, 1.0)), 1),
+                round(100.0 * candidate.score, 1),
                 "sift",
                 candidate.inlier_count,
                 candidate.inlier_ratio,
@@ -130,7 +224,7 @@ class ImageMatcher:
             )
             for candidate in candidates
         ]
-        return sorted(results, key=lambda result: (-result.similarity, result.record.image_id))
+        return results, coarse_candidate_indices
 
     def _feature_query(self, query_gray: np.ndarray) -> tuple[np.ndarray, float]:
         height, width = query_gray.shape[:2]
@@ -186,6 +280,9 @@ class ImageMatcher:
         query_points: np.ndarray,
         query_descriptors: np.ndarray,
         extraction_scale: float,
+        query_gradient: np.ndarray | None = None,
+        geometry_weight: float | None = None,
+        structure_reliability: float | None = None,
     ) -> CandidateScore | None:
         candidate_features = self.index.by_image[image_id]
         if len(candidate_features.descriptors) < 2:
@@ -211,13 +308,11 @@ class ImageMatcher:
         destination_points = np.asarray(
             [candidate_features.points[match.trainIdx] for match in good], dtype=np.float32
         )
-        feature_affine, inlier_mask = cv2.estimateAffinePartial2D(
+        feature_affine, inlier_mask = self._estimate_axis_aligned_transform(
             source_points,
             destination_points,
-            method=cv2.RANSAC,
-            ransacReprojThreshold=4.0,
         )
-        if feature_affine is None or inlier_mask is None or not np.isfinite(feature_affine).all():
+        if feature_affine is None or inlier_mask is None:
             return None
 
         inliers = inlier_mask.ravel().astype(bool)
@@ -256,35 +351,312 @@ class ImageMatcher:
             return None
 
         candidate_gray = to_gray(read_image(record.path, self.settings.max_image_pixels))
-        warped = cv2.warpAffine(
-            candidate_gray,
-            query_to_candidate,
-            (query_width, query_height),
-            flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
-        )
+        warped = self._refined_warp(query_gray, candidate_gray, query_to_candidate)
+        if query_gradient is None:
+            query_gradient = gradient_magnitude(query_gray)
+        if structure_reliability is None:
+            structure_reliability = self._query_structure_reliability(query_gradient)
+        if geometry_weight is None:
+            geometry_weight = self._query_geometry_weight(query_gradient)
         gray_score = self._unit_correlation(query_gray, warped)
         edge_score = self._unit_correlation(
-            gradient_magnitude(query_gray),
+            query_gradient,
             gradient_magnitude(warped),
         )
-        appearance = 0.7 * gray_score + 0.3 * edge_score
-
-        projected = cv2.transform(source_points[None, :, :], feature_affine)[0]
-        errors = np.linalg.norm(projected[inliers] - destination_points[inliers], axis=1)
-        reprojection_quality = float(np.clip(1.0 - errors.mean() / 4.0, 0.0, 1.0))
-        count_quality = min(inlier_count / 20.0, 1.0)
-        geometry = float(
-            np.clip(0.5 * inlier_ratio + 0.3 * count_quality + 0.2 * reprojection_quality, 0.0, 1.0)
+        appearance = self._appearance_score(
+            gray_score,
+            edge_score,
+            structure_reliability,
         )
-        raw_score = 0.4 * geometry + 0.5 * appearance
+        feature_shape = (
+            max(1, round(query_height * extraction_scale)),
+            max(1, round(query_width * extraction_scale)),
+        )
+        geometry_quality = self._geometry_quality(
+            source_points,
+            destination_points,
+            feature_affine,
+            inliers,
+            feature_shape,
+            inlier_ratio,
+        )
+        score = self._adaptive_score(appearance, geometry_quality, geometry_weight)
         return CandidateScore(
             record,
-            geometry,
             appearance,
-            raw_score,
+            geometry_quality,
+            score,
             inlier_count,
             inlier_ratio,
         )
+
+    @staticmethod
+    def _query_structure_reliability(query_gradient: np.ndarray) -> float:
+        if not query_gradient.size:
+            return 0.0
+        density = np.count_nonzero(
+            query_gradient >= _STRUCTURE_GRADIENT_THRESHOLD
+        ) / query_gradient.size
+        return float(np.clip(density / _STRUCTURE_DENSITY_SATURATION, 0.0, 1.0))
+
+    @classmethod
+    def _query_geometry_weight(cls, query_gradient: np.ndarray) -> float:
+        structure_reliability = cls._query_structure_reliability(query_gradient)
+        return _GEOMETRY_WEIGHT_MAX - (
+            (_GEOMETRY_WEIGHT_MAX - _GEOMETRY_WEIGHT_MIN) * structure_reliability
+        )
+
+    @staticmethod
+    def _appearance_score(
+        gray_score: float,
+        edge_score: float,
+        structure_reliability: float,
+    ) -> float:
+        edge_weight = _EDGE_WEIGHT_MIN + (
+            (_EDGE_WEIGHT_MAX - _EDGE_WEIGHT_MIN) * structure_reliability
+        )
+        return (1.0 - edge_weight) * gray_score + edge_weight * edge_score
+
+    @staticmethod
+    def _estimate_axis_aligned_transform(
+        source_points: np.ndarray,
+        destination_points: np.ndarray,
+    ) -> tuple[np.ndarray | None, np.ndarray | None]:
+        point_count = len(source_points)
+        if (
+            source_points.shape != destination_points.shape
+            or source_points.ndim != 2
+            or source_points.shape[1:] != (2,)
+            or point_count < 2
+        ):
+            return None, None
+
+        source = source_points.astype(np.float64, copy=False)
+        destination = destination_points.astype(np.float64, copy=False)
+        first_indices, second_indices = np.triu_indices(point_count, k=1)
+        source_deltas = source[second_indices] - source[first_indices]
+        destination_deltas = destination[second_indices] - destination[first_indices]
+        baselines = np.einsum("ij,ij->i", source_deltas, source_deltas)
+        scales = np.einsum("ij,ij->i", source_deltas, destination_deltas) / np.maximum(
+            baselines,
+            1.0,
+        )
+        valid = (
+            (baselines >= _AXIS_RANSAC_MIN_BASELINE_SQUARED)
+            & np.isfinite(scales)
+            & (scales > 0.0)
+        )
+        if not np.any(valid):
+            return None, None
+
+        first_indices = first_indices[valid]
+        second_indices = second_indices[valid]
+        baselines = baselines[valid]
+        scales = scales[valid]
+        if len(scales) > _AXIS_RANSAC_MAX_MODELS:
+            selected = np.argpartition(
+                baselines,
+                -_AXIS_RANSAC_MAX_MODELS,
+            )[-_AXIS_RANSAC_MAX_MODELS:]
+            first_indices = first_indices[selected]
+            second_indices = second_indices[selected]
+            scales = scales[selected]
+
+        translations = 0.5 * (
+            destination[first_indices]
+            - scales[:, None] * source[first_indices]
+            + destination[second_indices]
+            - scales[:, None] * source[second_indices]
+        )
+        projected = scales[:, None, None] * source[None, :, :] + translations[:, None, :]
+        errors = np.linalg.norm(projected - destination[None, :, :], axis=2)
+        model_inliers = errors <= _AXIS_RANSAC_REPROJECTION_THRESHOLD
+        inlier_counts = model_inliers.sum(axis=1)
+        mean_errors = np.divide(
+            np.where(model_inliers, errors, 0.0).sum(axis=1),
+            inlier_counts,
+            out=np.full(len(inlier_counts), np.inf),
+            where=inlier_counts > 0,
+        )
+        best_index = int(np.lexsort((mean_errors, -inlier_counts))[0])
+        inliers = model_inliers[best_index]
+        scale = float(scales[best_index])
+        translation = translations[best_index]
+
+        for _ in range(2):
+            inlier_source = source[inliers]
+            inlier_destination = destination[inliers]
+            if len(inlier_source) < 2:
+                return None, None
+            source_mean = inlier_source.mean(axis=0)
+            destination_mean = inlier_destination.mean(axis=0)
+            centered_source = inlier_source - source_mean
+            denominator = float(np.einsum("ij,ij->", centered_source, centered_source))
+            if denominator <= 0.0:
+                return None, None
+            scale = float(
+                np.einsum(
+                    "ij,ij->",
+                    centered_source,
+                    inlier_destination - destination_mean,
+                )
+                / denominator
+            )
+            if not np.isfinite(scale) or scale <= 0.0:
+                return None, None
+            translation = destination_mean - scale * source_mean
+            errors = np.linalg.norm(scale * source + translation - destination, axis=1)
+            updated_inliers = errors <= _AXIS_RANSAC_REPROJECTION_THRESHOLD
+            if np.array_equal(updated_inliers, inliers):
+                break
+            inliers = updated_inliers
+
+        affine = np.asarray(
+            [
+                [scale, 0.0, translation[0]],
+                [0.0, scale, translation[1]],
+            ],
+            dtype=np.float64,
+        )
+        return affine, inliers.astype(np.uint8)[:, None]
+
+    @staticmethod
+    def _geometry_quality(
+        source_points: np.ndarray,
+        destination_points: np.ndarray,
+        affine: np.ndarray,
+        inliers: np.ndarray,
+        feature_shape: tuple[int, int],
+        inlier_ratio: float,
+    ) -> float:
+        inlier_count = int(inliers.sum())
+        projected = cv2.transform(source_points[None, :, :], affine)[0]
+        errors = np.linalg.norm(
+            projected[inliers] - destination_points[inliers],
+            axis=1,
+        )
+        reprojection_quality = float(np.clip(1.0 - errors.mean() / 4.0, 0.0, 1.0))
+        count_quality = min(inlier_count / _GEOMETRY_COUNT_SATURATION, 1.0)
+
+        inlier_points = source_points[inliers]
+        feature_height, feature_width = feature_shape
+        x_span = float(np.ptp(inlier_points[:, 0]) / max(1, feature_width - 1))
+        y_span = float(np.ptp(inlier_points[:, 1]) / max(1, feature_height - 1))
+        spread_quality = float(
+            np.sqrt(
+                np.clip(x_span / _GEOMETRY_SPREAD_SATURATION, 0.0, 1.0)
+                * np.clip(y_span / _GEOMETRY_SPREAD_SATURATION, 0.0, 1.0)
+            )
+        )
+        quality = float(
+            np.clip(
+                0.5 * inlier_ratio
+                + 0.1 * count_quality
+                + 0.25 * reprojection_quality
+                + 0.15 * spread_quality,
+                0.0,
+                1.0,
+            )
+        )
+        if min(x_span, y_span) < _GEOMETRY_MIN_AXIS_SPAN:
+            return min(quality, _GEOMETRY_QUALITY_FLOOR)
+        return quality
+
+    @staticmethod
+    def _adaptive_score(
+        appearance: float,
+        geometry_quality: float,
+        geometry_weight: float,
+    ) -> float:
+        geometry_confidence = float(
+            np.clip(
+                (geometry_quality - _GEOMETRY_QUALITY_FLOOR) / _GEOMETRY_QUALITY_RANGE,
+                0.0,
+                1.0,
+            )
+        )
+        geometry_signal = geometry_confidence
+        factor = 1.0 + 2.0 * geometry_weight * geometry_signal * (1.0 - appearance)
+        return float(np.clip(appearance * factor, 0.0, 1.0))
+
+    @staticmethod
+    def _refined_warp(
+        query_gray: np.ndarray,
+        candidate_gray: np.ndarray,
+        initial_transform: np.ndarray,
+    ) -> np.ndarray:
+        query_height, query_width = query_gray.shape[:2]
+        query_center = np.asarray(
+            [(query_width - 1.0) / 2.0, (query_height - 1.0) / 2.0, 1.0],
+            dtype=np.float64,
+        )
+        candidate_center = initial_transform @ query_center
+        initial_scale = float(np.hypot(initial_transform[0, 0], initial_transform[0, 1]))
+        best_warp = cv2.warpAffine(
+            candidate_gray,
+            initial_transform,
+            (query_width, query_height),
+            flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
+        )
+        best_score = normalized_correlation(query_gray, best_warp)
+        if best_score >= 0.9:
+            return best_warp
+
+        for factor in _ALIGNMENT_SCALE_FACTORS:
+            scale = initial_scale * factor
+            half_width = scale * (query_width / 2.0 + _ALIGNMENT_SEARCH_RADIUS + 2)
+            half_height = scale * (query_height / 2.0 + _ALIGNMENT_SEARCH_RADIUS + 2)
+            left = max(0, int(np.floor(candidate_center[0] - half_width)))
+            top = max(0, int(np.floor(candidate_center[1] - half_height)))
+            right = min(candidate_gray.shape[1], int(np.ceil(candidate_center[0] + half_width)))
+            bottom = min(
+                candidate_gray.shape[0], int(np.ceil(candidate_center[1] + half_height))
+            )
+            region = candidate_gray[top:bottom, left:right]
+            if (
+                region.shape[1] < round(scale * query_width)
+                or region.shape[0] < round(scale * query_height)
+            ):
+                continue
+
+            resized_width = max(query_width, round(region.shape[1] / scale))
+            resized_height = max(query_height, round(region.shape[0] / scale))
+            resized = cv2.resize(
+                region,
+                (resized_width, resized_height),
+                interpolation=cv2.INTER_AREA if scale > 1.0 else cv2.INTER_CUBIC,
+            )
+            response = cv2.matchTemplate(resized, query_gray, cv2.TM_CCOEFF_NORMED)
+            response = np.nan_to_num(
+                response,
+                copy=False,
+                nan=-1.0,
+                posinf=-1.0,
+                neginf=-1.0,
+            )
+            _, _, _, location = cv2.minMaxLoc(response)
+            scale_x = region.shape[1] / resized_width
+            scale_y = region.shape[0] / resized_height
+            candidate_transform = np.asarray(
+                [
+                    [scale_x, 0.0, left + location[0] * scale_x],
+                    [0.0, scale_y, top + location[1] * scale_y],
+                ],
+                dtype=np.float64,
+            )
+            candidate_warp = cv2.warpAffine(
+                candidate_gray,
+                candidate_transform,
+                (query_width, query_height),
+                flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
+            )
+            score = normalized_correlation(query_gray, candidate_warp)
+            if score > best_score:
+                best_score = score
+                best_warp = candidate_warp
+
+        return best_warp
+
 
     @staticmethod
     def _mapped_geometry_is_valid(
@@ -306,7 +678,7 @@ class ImageMatcher:
 
     @staticmethod
     def _unit_correlation(left: np.ndarray, right: np.ndarray) -> float:
-        return float(np.clip((normalized_correlation(left, right) + 1.0) / 2.0, 0.0, 1.0))
+        return float(np.clip(normalized_correlation(left, right), 0.0, 1.0))
 
     def _fallback(self, query_gray: np.ndarray) -> MatchResult:
         return self._fallback_results(query_gray, set())[0]
@@ -316,6 +688,7 @@ class ImageMatcher:
         query_gray: np.ndarray,
         exclude_ids: set[str],
         requested_count: int = 0,
+        candidate_indices: list[int] | None = None,
     ) -> list[MatchResult]:
         if (
             not self.catalog.records
@@ -324,21 +697,42 @@ class ImageMatcher:
         ):
             raise _NoMatchEvidenceError("Fallback index is empty")
 
-        candidate_indices = self._coarse_candidates(query_gray, exclude_ids, requested_count)
-        scored = [self._template_score(index, query_gray) for index in candidate_indices]
+        if candidate_indices is None:
+            candidate_indices = self._coarse_candidates(
+                query_gray,
+                exclude_ids,
+                requested_count,
+            )
+        else:
+            candidate_indices = [
+                index
+                for index in candidate_indices
+                if self.index.image_ids[index] not in exclude_ids
+            ]
+        refinement_count = min(
+            max(requested_count, _MIN_TEMPLATE_REFINEMENT_COUNT),
+            len(candidate_indices),
+        )
+        candidate_indices = candidate_indices[:refinement_count]
+        query_gradient = gradient_magnitude(query_gray)
+        structure_reliability = self._query_structure_reliability(query_gradient)
+        scored = [
+            self._template_score(
+                index,
+                query_gray,
+                query_gradient,
+                structure_reliability,
+            )
+            for index in candidate_indices
+        ]
         ranking = sorted(
             zip(candidate_indices, scored, strict=True),
             key=lambda item: (-item[1], self.index.image_ids[item[0]]),
         )
-        if not ranking:
-            return []
-        _, best_score = ranking[0]
-        second_score = ranking[1][1] if len(ranking) > 1 else 0.0
-        margin = float(np.clip((best_score - second_score) / 0.2, 0.0, 1.0))
         results = [
             MatchResult(
                 self.catalog.get(self.index.image_ids[image_index]),
-                round(min(89.9, 100.0 * (0.85 * score + 0.15 * margin)), 1),
+                round(100.0 * score, 1),
                 "template",
                 0,
                 0.0,
@@ -417,9 +811,15 @@ class ImageMatcher:
         finite = response[np.isfinite(response)]
         if not len(finite):
             return float("nan")
-        return float(np.clip((float(finite.max()) + 1.0) / 2.0, 0.0, 1.0))
+        return float(np.clip(float(finite.max()), 0.0, 1.0))
 
-    def _template_score(self, image_index: int, query_gray: np.ndarray) -> float:
+    def _template_score(
+        self,
+        image_index: int,
+        query_gray: np.ndarray,
+        query_gradient: np.ndarray | None = None,
+        structure_reliability: float | None = None,
+    ) -> float:
         query_height, query_width = query_gray.shape[:2]
         if query_height == 0 or query_width == 0:
             return 0.0
@@ -435,7 +835,10 @@ class ImageMatcher:
         pyramid_sizes = sorted(
             {int(size) for size in self.index.coarse_templates.region_sizes[owner_mask]}
         )
-        query_gradient = gradient_magnitude(query_gray)
+        if query_gradient is None:
+            query_gradient = gradient_magnitude(query_gray)
+        if structure_reliability is None:
+            structure_reliability = self._query_structure_reliability(query_gradient)
         best_score = 0.0
         seen_dimensions: set[tuple[int, int]] = set()
 
@@ -458,7 +861,12 @@ class ImageMatcher:
 
             gray_score = self._template_peak(level, query_gray)
             edge_score = self._template_peak(gradient_magnitude(level), query_gradient)
-            best_score = max(best_score, 0.7 * gray_score + 0.3 * edge_score)
+            appearance = self._appearance_score(
+                gray_score,
+                edge_score,
+                structure_reliability,
+            )
+            best_score = max(best_score, appearance)
 
         return float(np.clip(best_score, 0.0, 1.0))
 
@@ -467,4 +875,4 @@ class ImageMatcher:
         response = cv2.matchTemplate(candidate, query, cv2.TM_CCOEFF_NORMED)
         finite = response[np.isfinite(response)]
         peak = float(finite.max()) if len(finite) else -1.0
-        return float(np.clip((peak + 1.0) / 2.0, 0.0, 1.0))
+        return float(np.clip(peak, 0.0, 1.0))

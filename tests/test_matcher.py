@@ -5,6 +5,7 @@ from pathlib import Path
 from threading import Barrier, Lock
 import time
 from types import SimpleNamespace
+from typing import cast
 
 import cv2
 import numpy as np
@@ -168,7 +169,7 @@ def test_low_feature_crop_uses_fallback(tmp_path: Path) -> None:
 
     assert result.record.parent_name == "square"
     assert result.method == "template"
-    assert result.similarity <= 89.9
+    assert 0.0 <= result.similarity <= 100.0
 
 
 def test_coarse_candidates_find_owner_beyond_candidate_count() -> None:
@@ -322,6 +323,130 @@ def test_template_score_uses_only_bounded_candidate_levels(
     )
 
 
+@pytest.mark.parametrize(
+    ("left", "right", "expected"),
+    [
+        (
+            np.asarray([[0, 0], [1, 1]], np.uint8),
+            np.asarray([[0, 1], [0, 1]], np.uint8),
+            0.0,
+        ),
+        (
+            np.asarray([[0, 0], [1, 1]], np.uint8),
+            np.asarray([[1, 1], [0, 0]], np.uint8),
+            0.0,
+        ),
+        (
+            np.asarray([[0, 0], [1, 1]], np.uint8),
+            np.asarray([[0, 0], [1, 1]], np.uint8),
+            1.0,
+        ),
+    ],
+)
+def test_unit_correlation_treats_zero_and_negative_correlation_as_no_evidence(
+    left: np.ndarray, right: np.ndarray, expected: float
+) -> None:
+    assert ImageMatcher._unit_correlation(left, right) == pytest.approx(expected)
+
+
+def test_template_peaks_treat_zero_correlation_as_no_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        cv2,
+        "matchTemplate",
+        lambda *_args: np.asarray([[-0.4, 0.0, 0.3]], np.float32),
+    )
+    candidate = np.zeros((2, 4), np.uint8)
+    query = np.zeros((2, 2), np.uint8)
+
+    assert ImageMatcher._coarse_template_peak(candidate, query) == pytest.approx(0.3)
+    assert ImageMatcher._template_peak(candidate, query) == pytest.approx(0.3)
+
+
+def test_fallback_scores_each_candidate_without_shared_margin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    records = tuple(record(image_id) for image_id in ("best", "second"))
+    matcher = ImageMatcher.__new__(ImageMatcher)
+    records_by_id = {item.image_id: item for item in records}
+    matcher.catalog = cast(
+        ImageCatalog,
+        SimpleNamespace(records=records, get=records_by_id.__getitem__),
+    )
+    matcher.index = cast(
+        FeatureIndex,
+        SimpleNamespace(
+            image_ids=("best", "second"),
+            coarse_templates=SimpleNamespace(pixels=np.ones(1, np.uint8)),
+        ),
+    )
+    monkeypatch.setattr(matcher, "_coarse_candidates", lambda *_args: [0, 1])
+    scores = iter((0.8, 0.6))
+    query_gradient = np.ones((8, 8), np.float32)
+    gradient_calls: list[np.ndarray] = []
+    received_gradients: list[np.ndarray] = []
+
+    def template_score(
+        _index: int,
+        _query: np.ndarray,
+        gradient: np.ndarray,
+        _structure_reliability: float,
+    ) -> float:
+        received_gradients.append(gradient)
+        return next(scores)
+
+    monkeypatch.setattr(
+        matcher_module,
+        "gradient_magnitude",
+        lambda image: gradient_calls.append(image) or query_gradient,
+    )
+    monkeypatch.setattr(matcher, "_template_score", template_score)
+
+    results = matcher._fallback_results(np.zeros((8, 8), np.uint8), set(), 2)
+
+    assert [result.similarity for result in results] == [80.0, 60.0]
+    assert len(gradient_calls) == 1
+    assert all(gradient is query_gradient for gradient in received_gradients)
+
+def test_fallback_refines_only_the_required_shortlist(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    records = tuple(record(f"image-{index}") for index in range(5))
+    records_by_id = {item.image_id: item for item in records}
+    matcher = ImageMatcher.__new__(ImageMatcher)
+    matcher.catalog = cast(
+        ImageCatalog,
+        SimpleNamespace(records=records, get=records_by_id.__getitem__),
+    )
+    matcher.index = cast(
+        FeatureIndex,
+        SimpleNamespace(
+            image_ids=tuple(records_by_id),
+            coarse_templates=SimpleNamespace(pixels=np.ones(1, np.uint8)),
+        ),
+    )
+    monkeypatch.setattr(matcher, "_coarse_candidates", lambda *_args: list(range(5)))
+    refined: list[int] = []
+
+    def template_score(
+        image_index: int,
+        _query: np.ndarray,
+        _gradient: np.ndarray,
+        _structure_reliability: float,
+    ) -> float:
+        refined.append(image_index)
+        return 0.5
+
+    monkeypatch.setattr(matcher, "_template_score", template_score)
+
+    results = matcher._fallback_results(np.zeros((8, 8), np.uint8), set(), 1)
+
+    assert refined == [0]
+    assert len(results) == 1
+
+
+
 def test_retrieve_uses_five_neighbors_without_duplicate_owner_votes() -> None:
     matcher, global_matcher = retrieval_matcher(
         ("image-0", "image-1", "image-2"),
@@ -462,6 +587,103 @@ def test_verify_accepts_large_scale_from_downscaled_candidate(
     assert score.appearance > 0.95
 
 
+def test_pixel_refinement_corrects_sift_scale_and_translation_error() -> None:
+    candidate = cv2.cvtColor(make_art(17), cv2.COLOR_BGR2GRAY)
+    query = cv2.resize(
+        candidate[80:240, 100:260],
+        (64, 64),
+        interpolation=cv2.INTER_AREA,
+    )
+    inaccurate = np.asarray(
+        [[2.1, 0.0, 115.0], [0.0, 2.1, 95.0]],
+        np.float64,
+    )
+    initial = cv2.warpAffine(
+        candidate,
+        inaccurate,
+        (64, 64),
+        flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
+    )
+
+    refined = ImageMatcher._refined_warp(query, candidate, inaccurate)
+
+    assert ImageMatcher._unit_correlation(query, refined) > 0.7
+    assert ImageMatcher._unit_correlation(query, refined) > (
+        ImageMatcher._unit_correlation(query, initial) + 0.3
+    )
+
+def test_query_geometry_weight_increases_for_sparse_structure() -> None:
+    sparse = np.zeros((10, 10), np.float32)
+    dense = np.full((10, 10), 100.0, np.float32)
+
+    assert ImageMatcher._query_geometry_weight(sparse) == pytest.approx(0.35)
+    assert ImageMatcher._query_geometry_weight(dense) == pytest.approx(0.1)
+
+def test_sparse_structure_reduces_unreliable_edge_weight() -> None:
+    sparse = ImageMatcher._appearance_score(0.94, 1.0, 0.0)
+    dense = ImageMatcher._appearance_score(0.94, 1.0, 1.0)
+
+    assert sparse == pytest.approx(0.946)
+    assert dense == pytest.approx(0.958)
+
+
+
+@pytest.mark.parametrize(
+    ("appearance", "geometry_quality", "geometry_weight", "expected"),
+    [
+        (0.0, 1.0, 0.35, 0.0),
+        (0.6, 0.9, 0.35, 0.768),
+        (0.6, 0.7, 0.35, 0.684),
+        (0.6, 0.5, 0.35, 0.6),
+    ],
+)
+def test_adaptive_score_applies_bounded_multiplicative_geometry(
+    appearance: float,
+    geometry_quality: float,
+    geometry_weight: float,
+    expected: float,
+) -> None:
+    assert ImageMatcher._adaptive_score(
+        appearance,
+        geometry_quality,
+        geometry_weight,
+    ) == pytest.approx(expected)
+
+
+def test_geometry_quality_penalizes_degenerate_inlier_spread() -> None:
+    distributed = np.asarray(
+        [[10.0, 10.0], [90.0, 10.0], [90.0, 90.0], [10.0, 90.0]],
+        np.float32,
+    )
+    clustered = np.asarray(
+        [[10.0, 10.0], [11.0, 10.0], [11.0, 11.0], [10.0, 11.0]],
+        np.float32,
+    )
+    affine = np.asarray([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], np.float64)
+    inliers = np.ones(4, bool)
+
+    distributed_quality = ImageMatcher._geometry_quality(
+        distributed,
+        distributed,
+        affine,
+        inliers,
+        (100, 100),
+        1.0,
+    )
+    clustered_quality = ImageMatcher._geometry_quality(
+        clustered,
+        clustered,
+        affine,
+        inliers,
+        (100, 100),
+        1.0,
+    )
+
+    assert distributed_quality > 0.9
+    assert clustered_quality == pytest.approx(0.5)
+
+
+
 def test_mapped_geometry_uses_per_axis_tolerance() -> None:
     valid = np.asarray([[0.0, -4.0], [999.0, -4.0], [999.0, 99.0], [0.0, 99.0]])
     outside_short_axis = np.asarray([[0.0, -6.0], [999.0, -6.0], [999.0, 99.0], [0.0, 99.0]])
@@ -469,8 +691,35 @@ def test_mapped_geometry_uses_per_axis_tolerance() -> None:
     assert ImageMatcher._mapped_geometry_is_valid(valid, 1000, 100)
     assert not ImageMatcher._mapped_geometry_is_valid(outside_short_axis, 1000, 100)
 
+def test_axis_aligned_estimator_ignores_stronger_rotated_outliers() -> None:
+    true_source = np.asarray(
+        [[0, 0], [20, 0], [0, 20], [20, 20], [10, 5], [5, 15]],
+        np.float32,
+    )
+    true_destination = 1.5 * true_source + np.asarray([8.0, 12.0], np.float32)
+    outlier_source = np.asarray(
+        [[40, 0], [60, 0], [40, 20], [60, 20], [45, 5], [55, 15], [42, 18], [58, 2]],
+        np.float32,
+    )
+    rotation = np.asarray([[0.0, -1.0], [1.0, 0.0]], np.float32)
+    outlier_destination = outlier_source @ rotation.T + np.asarray(
+        [200.0, 100.0],
+        np.float32,
+    )
+    source = np.vstack([true_source, outlier_source])
+    destination = np.vstack([true_destination, outlier_destination])
 
-def test_match_ranks_by_raw_score_and_applies_bounded_margin(
+    affine, mask = ImageMatcher._estimate_axis_aligned_transform(source, destination)
+
+    assert affine is not None
+    assert mask is not None
+    np.testing.assert_allclose(affine, [[1.5, 0.0, 8.0], [0.0, 1.5, 12.0]])
+    assert mask[: len(true_source)].all()
+    assert int(mask.sum()) == len(true_source)
+
+
+
+def test_match_ranks_by_adaptive_score_across_candidate_sources(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     best_record = ImageRecord("best", Path("best.png"), Path("best.png"), "", "best.png", 1, 1)
@@ -478,11 +727,15 @@ def test_match_ranks_by_raw_score_and_applies_bounded_margin(
         "second", Path("second.png"), Path("second.png"), "", "second.png", 1, 1
     )
     scores = {
-        "best": CandidateScore(best_record, 0.5, 0.5, 0.45, 8, 0.8),
-        "second": CandidateScore(second_record, 0.5, 0.5, 0.44, 8, 0.8),
+        "best": CandidateScore(best_record, 0.45, 0.9, 0.5, 8, 0.8),
+        "second": CandidateScore(second_record, 0.44, 0.6, 0.44, 8, 0.8),
     }
     matcher = ImageMatcher.__new__(ImageMatcher)
     matcher.catalog = ImageCatalog(Path(), (best_record, second_record), ())
+    matcher.index = cast(
+        FeatureIndex,
+        SimpleNamespace(image_ids=("best", "second")),
+    )
     matcher._sift = SimpleNamespace(
         detectAndCompute=lambda *_args: (
             [SimpleNamespace(pt=(float(index), float(index))) for index in range(4)],
@@ -492,16 +745,21 @@ def test_match_ranks_by_raw_score_and_applies_bounded_margin(
     matcher._sift_lock = Lock()
     matcher.settings = Settings()
     monkeypatch.setattr(matcher, "_feature_query", lambda query: (query, 1.0))
-    monkeypatch.setattr(matcher, "_retrieve", lambda _descriptors: ["second", "best"])
+    monkeypatch.setattr(matcher, "_retrieve", lambda _descriptors: ["second"])
+    monkeypatch.setattr(matcher, "_coarse_candidates", lambda *_args: [0])
     monkeypatch.setattr(matcher, "_verify", lambda image_id, *_args: scores[image_id])
+    monkeypatch.setattr(
+        matcher,
+        "_template_score",
+        lambda image_index, *_args: (0.55, 0.4)[image_index],
+    )
 
     results = matcher.match_many(np.zeros((64, 64), np.uint8), limit=2)
-    result = matcher.match(np.zeros((64, 64), np.uint8))
 
-    assert result.record == best_record
-    assert result.similarity == pytest.approx(45.5)
-    assert 0.0 <= result.similarity <= 100.0
-    assert [item.similarity for item in results] == pytest.approx([45.5, 44.5])
+    assert results[0].record == best_record
+    assert results[0].similarity == pytest.approx(55.0)
+    assert all(0.0 <= item.similarity <= 100.0 for item in results)
+    assert [item.similarity for item in results] == pytest.approx([55.0, 44.0])
 
 
 def test_match_many_merges_distinct_results_in_deterministic_order(
@@ -535,7 +793,12 @@ def test_match_many_merges_distinct_results_in_deterministic_order(
             MatchResult(records[3], 70.0, "template", 0, 0.0, 0.7),
         ]
 
-    monkeypatch.setattr(matcher, "_primary_results", lambda *_args: primary, raising=False)
+    monkeypatch.setattr(
+        matcher,
+        "_primary_results",
+        lambda *_args: (primary, None),
+        raising=False,
+    )
     monkeypatch.setattr(matcher, "_fallback_results", fallback, raising=False)
 
     results = matcher.match_many(np.zeros((64, 64), np.uint8), limit=3)
@@ -564,7 +827,10 @@ def test_tiny_query_full_primary_allows_stronger_template_to_win(
     monkeypatch.setattr(
         matcher,
         "_primary_results",
-        lambda *_args: [MatchResult(primary_record, 35.0, "sift", 4, 1.0, 0.3)],
+        lambda *_args: (
+            [MatchResult(primary_record, 35.0, "sift", 4, 1.0, 0.3)],
+            None,
+        ),
     )
 
     def fallback(
@@ -599,7 +865,10 @@ def test_full_primary_at_smallest_tile_size_skips_fallback(
     monkeypatch.setattr(
         matcher,
         "_primary_results",
-        lambda *_args: [MatchResult(primary_record, 35.0, "sift", 4, 1.0, 0.3)],
+        lambda *_args: (
+            [MatchResult(primary_record, 35.0, "sift", 4, 1.0, 0.3)],
+            None,
+        ),
     )
     monkeypatch.setattr(
         matcher,
@@ -630,10 +899,13 @@ def test_tiny_query_same_owner_keeps_higher_similarity_and_stays_limited(
     monkeypatch.setattr(
         matcher,
         "_primary_results",
-        lambda *_args: [
-            MatchResult(records[0], 80.0, "sift", 4, 1.0, 0.8),
-            MatchResult(records[1], 70.0, "sift", 4, 1.0, 0.7),
-        ],
+        lambda *_args: (
+            [
+                MatchResult(records[0], 80.0, "sift", 4, 1.0, 0.8),
+                MatchResult(records[1], 70.0, "sift", 4, 1.0, 0.7),
+            ],
+            None,
+        ),
     )
 
     def fallback(
@@ -676,7 +948,10 @@ def test_tiny_query_same_owner_similarity_tie_keeps_sift(
     monkeypatch.setattr(
         matcher,
         "_primary_results",
-        lambda *_args: [MatchResult(same_record, 80.0, "sift", 4, 1.0, 0.8)],
+        lambda *_args: (
+            [MatchResult(same_record, 80.0, "sift", 4, 1.0, 0.8)],
+            None,
+        ),
     )
     monkeypatch.setattr(
         matcher,

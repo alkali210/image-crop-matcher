@@ -39,34 +39,51 @@ During indexing, the application extracts SIFT features from each image and buil
 ### SIFT and Geometric Verification
 
 1. Convert the query to grayscale. If its shortest edge is below 256 px, scale it proportionally to 256 px before extracting SIFT keypoints and descriptors.
-2. Use FLANN KNN with a Lowe ratio of `0.78` to vote for source-image candidates from the global descriptor index.
-3. Rematch descriptors for each candidate and estimate a partial affine transform with RANSAC. At least 4 geometric inliers are required.
-4. Warp the candidate region to the query dimensions and calculate grayscale and gradient correlations.
+2. Use FLANN KNN with a Lowe ratio of `0.78` to vote for source-image candidates from the global descriptor index. If this does not produce enough geometrically valid candidates, supplement it with the low-resolution template shortlist.
+3. Rematch descriptors for each candidate and run deterministic RANSAC constrained to uniform scale and translation. At least 4 geometric inliers are required; rotation is not part of the fitted model.
+4. Refine the SIFT scale and translation with a local pixel-correlation search, then warp the candidate region to the query dimensions.
+5. Calculate grayscale and gradient correlations. SIFT inliers validate and locate the crop, then provide a bounded geometric correction to the pixel score.
 
-Normalized correlations are mapped to `[0, 1]`. The primary score is:
+Normalized correlations are clipped to `[0, 1]`, so zero or negative correlation contributes no evidence. The SIFT path uses:
 
 ```text
-appearance           = 0.7 × gray_score + 0.3 × edge_score
-count_quality        = min(inlier_count / 20, 1)
+edge_weight          = 0.1 + 0.2 × structure_reliability
+appearance           = (1 - edge_weight) × gray_score + edge_weight × edge_score
+count_quality        = min(inlier_count / 12, 1)
 reprojection_quality = clip(1 - mean_reprojection_error / 4, 0, 1)
-geometry              = clip(0.5 × inlier_ratio + 0.3 × count_quality + 0.2 × reprojection_quality, 0, 1)
-raw_score             = 0.4 × geometry + 0.5 × appearance
-margin                = clip((best_score - second_score) / 0.2, 0, 1)
-similarity            = 100 × clip(raw_score + 0.1 × margin, 0, 1)
+spread_quality       = normalized x/y span of query inliers
+geometry_quality     = 0.5 × inlier_ratio
+                     + 0.1 × count_quality
+                     + 0.25 × reprojection_quality
+                     + 0.15 × spread_quality
+geometry_confidence  = clip((geometry_quality - 0.5) / 0.4, 0, 1)
+structure_reliability = clip(query_edge_density / 0.35, 0, 1)
+geometry_weight       = 0.35 - 0.25 × structure_reliability
+similarity            = 100 × clip(
+    appearance × (1 + 2 × geometry_weight × geometry_confidence
+                  × (1 - appearance)),
+    0,
+    1
+)
 ```
+
+The query edge density is calculated once from the gradient image using a threshold of `64`. Sparse-structure queries use up to `35%` geometry weight and reduce edge correlation to `10%`, while texture-rich queries limit geometry to `10%` and use `30%` edge correlation. Geometry is confirmation-only: a valid model can increase but never decrease the pixel score. The `(1 - appearance)` term preserves headroom for strong pixel matches instead of saturating them at `100%`. Degenerate inliers spanning less than `2%` of either query axis cannot produce a positive geometric correction. Because geometry multiplies appearance, zero pixel evidence always remains zero.
 
 ### Template Fallback
 
 The template path supplements results when SIFT evidence is insufficient, the query's shortest edge is below 64 px, or SIFT does not produce enough entries to fill the candidate list:
 
-1. Coarsely rank candidates with normalized cross-correlation (NCC) over the low-resolution grayscale template pyramid.
-2. Match grayscale and gradient images at multiple scales of each candidate source.
+1. Coarsely rank candidates with normalized cross-correlation (NCC) over the low-resolution grayscale template pyramid. Reuse this shortlist if SIFT supplementation already computed it.
+2. Match grayscale and gradient images at multiple scales for only as many leading candidates as the response still needs.
 3. Calculate the ranking score as follows:
 
 ```text
-template_score = 0.7 × gray_score + 0.3 × edge_score
-similarity     = min(89.9, 100 × (0.85 × template_score + 0.15 × margin))
+edge_weight    = 0.1 + 0.2 × structure_reliability
+template_score = (1 - edge_weight) × gray_score + edge_weight × edge_score
+similarity     = 100 × template_score
 ```
+
+Template-only candidates have no geometric evidence and keep their unmodified pixel score. For sparse queries, a geometrically verified candidate also checks its template alignment and retains whichever complete hypothesis produces the stronger score; geometry from one location is never applied to a different template location.
 
 Final results are deduplicated and sorted by descending `similarity`. The value is a ranking-confidence score, not a probability. There is no rejection threshold, so the matcher returns available gallery candidates even when evidence is weak.
 
