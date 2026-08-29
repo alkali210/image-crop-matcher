@@ -577,7 +577,7 @@ main {
   font-weight: 500;
 }
 
-.results-empty > p:last-child {
+.results-empty>p:last-child {
   margin-top: 9px;
   color: var(--text-muted);
   font-size: 0.88rem;
@@ -707,6 +707,7 @@ main {
 
 .match-parent {
   margin-top: 13px;
+  font-size: 0.9rem;
   overflow-wrap: anywhere;
 }
 
@@ -773,6 +774,7 @@ main {
 }
 
 @media (max-width: 700px) {
+
   .site-header,
   main {
     width: min(100% - 28px, 1080px);
@@ -871,6 +873,7 @@ main {
 }
 
 @media (prefers-reduced-motion: reduce) {
+
   *,
   *::before,
   *::after {
