@@ -36,11 +36,15 @@ def make_bundle(gallery_dir: Path, cache_dir: Path, settings: Settings) -> Galle
         (CatalogManifestEntry("image.png", 1, 1),),
     )
     index = FeatureIndex(
-        (record.image_id,),
-        {},
-        np.empty((0, 128), dtype=np.float32),
-        np.empty(0, dtype=np.int32),
-        CoarseTemplateFeatures(
+        image_ids=(record.image_id,),
+        points=np.empty((0, 2), dtype=np.float32),
+        point_offsets=np.zeros(2, dtype=np.int64),
+        descriptors=np.empty((0, 128), dtype=np.uint8),
+        descriptor_offsets=np.zeros(2, dtype=np.int64),
+        working_widths=np.ones(1, dtype=np.int32),
+        working_heights=np.ones(1, dtype=np.int32),
+        working_scales=np.ones(1, dtype=np.float64),
+        coarse_templates=CoarseTemplateFeatures(
             pixels=np.empty(0, dtype=np.uint8),
             offsets=np.zeros(1, dtype=np.int64),
             widths=np.empty(0, dtype=np.int32),
@@ -48,6 +52,8 @@ def make_bundle(gallery_dir: Path, cache_dir: Path, settings: Settings) -> Galle
             image_indices=np.empty(0, dtype=np.int32),
             region_sizes=np.empty(0, dtype=np.int32),
         ),
+        representative_descriptors=np.empty((0, 128), dtype=np.float32),
+        representative_image_indices=np.empty(0, dtype=np.int32),
         loaded_from_cache=False,
     )
     matcher = ImageMatcher(catalog, index, settings)

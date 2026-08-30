@@ -1,4 +1,3 @@
-from collections import defaultdict
 from dataclasses import dataclass
 from threading import Lock
 
@@ -76,11 +75,16 @@ class ImageMatcher:
         self.catalog = catalog
         self.index = index
         self.settings = settings
-        self._flann_lock = Lock()
+        self._retrieval_lock = Lock()
         self._sift_lock = Lock()
         self._sift = cv2.SIFT_create(
-            nfeatures=settings.sift_features,
-            contrastThreshold=settings.sift_contrast_threshold,
+            settings.sift_features,
+            3,
+            settings.sift_contrast_threshold,
+            10,
+            1.6,
+            cv2.CV_8U,
+            False,
         )
 
     def match(self, query_bgr: np.ndarray) -> MatchResult:
@@ -237,41 +241,12 @@ class ImageMatcher:
 
     def _retrieve(self, descriptors: np.ndarray) -> list[str]:
         target_count = min(self.settings.candidate_count, len(self.index.image_ids))
-        matches_by_descriptor = []
-        k = min(5, len(self.index.descriptors))
-        if k >= 2:
-            with self._flann_lock:
-                matches_by_descriptor = self.index.global_matcher.knnMatch(descriptors, k=k)
-
-        votes: dict[int, float] = defaultdict(float)
-        for matches in matches_by_descriptor:
-            voted_owners: set[int] = set()
-            for rank, (match, next_match) in enumerate(zip(matches, matches[1:])):
-                if (
-                    not np.isfinite(match.distance)
-                    or not np.isfinite(next_match.distance)
-                    or next_match.distance <= 0.0
-                    or match.distance >= 0.78 * next_match.distance
-                ):
-                    continue
-                descriptor_index = int(match.trainIdx)
-                if not 0 <= descriptor_index < len(self.index.descriptor_image_indices):
-                    continue
-                image_index = int(self.index.descriptor_image_indices[descriptor_index])
-                if not 0 <= image_index < len(self.index.image_ids) or image_index in voted_owners:
-                    continue
-                ratio = max(0.0, match.distance) / next_match.distance
-                votes[image_index] += (1.0 - ratio) / (rank + 1)
-                voted_owners.add(image_index)
-
-        ranked_indices = sorted(votes, key=lambda index: (-votes[index], index))
-        ranked_set = set(ranked_indices)
-        ranked_indices.extend(
-            image_index
-            for image_index in range(len(self.index.image_ids))
-            if image_index not in ranked_set
-        )
-        return [self.index.image_ids[index] for index in ranked_indices[:target_count]]
+        with self._retrieval_lock:
+            ranked_indices = self.index.rank_image_indices(descriptors)
+        return [
+            self.index.image_ids[int(index)]
+            for index in ranked_indices[:target_count]
+        ]
 
     def _verify(
         self,
@@ -287,8 +262,12 @@ class ImageMatcher:
         candidate_features = self.index.by_image[image_id]
         if len(candidate_features.descriptors) < 2:
             return None
-        pairs = cv2.BFMatcher(cv2.NORM_L2).knnMatch(
+        local_query_descriptors = np.ascontiguousarray(
             query_descriptors,
+            dtype=candidate_features.descriptors.dtype,
+        )
+        pairs = cv2.BFMatcher(cv2.NORM_L2).knnMatch(
+            local_query_descriptors,
             candidate_features.descriptors,
             k=2,
         )

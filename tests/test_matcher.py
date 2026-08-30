@@ -73,52 +73,15 @@ def coarse_templates(
     )
 
 
-class FakeGlobalMatcher:
-    def __init__(self, matches: list[list[SimpleNamespace]]) -> None:
-        self.matches = matches
-        self.requested_k: int | None = None
+class FakeRankIndex:
+    def __init__(self, image_ids: tuple[str, ...], ranking: list[int]) -> None:
+        self.image_ids = image_ids
+        self.ranking = np.asarray(ranking, np.int32)
+        self.received_descriptors: np.ndarray | None = None
 
-    def knnMatch(self, _descriptors: np.ndarray, k: int) -> list[list[SimpleNamespace]]:
-        self.requested_k = k
-        return self.matches
-
-
-class RecordingGlobalMatcher:
-    def __init__(self, descriptors: np.ndarray) -> None:
-        self.matcher = cv2.FlannBasedMatcher(
-            {"algorithm": 1, "trees": 5},
-            {"checks": 64},
-        )
-        self.matcher.add([descriptors])
-        self.matcher.train()
-        self.requested_k: int | None = None
-
-    def knnMatch(self, descriptors: np.ndarray, k: int) -> list[list[cv2.DMatch]]:
-        self.requested_k = k
-        return self.matcher.knnMatch(descriptors, k=k)
-
-
-def neighbor(train_index: int, distance: float) -> SimpleNamespace:
-    return SimpleNamespace(trainIdx=train_index, distance=distance)
-
-
-def retrieval_matcher(
-    image_ids: tuple[str, ...],
-    owners: list[int],
-    matches: list[list[SimpleNamespace]],
-    candidate_count: int,
-) -> tuple[ImageMatcher, FakeGlobalMatcher]:
-    global_matcher = FakeGlobalMatcher(matches)
-    matcher = ImageMatcher.__new__(ImageMatcher)
-    matcher.index = SimpleNamespace(
-        descriptors=np.zeros((len(owners), 128), np.float32),
-        descriptor_image_indices=np.asarray(owners, np.int32),
-        image_ids=image_ids,
-        global_matcher=global_matcher,
-    )
-    matcher.settings = Settings(candidate_count=candidate_count)
-    matcher._flann_lock = Lock()
-    return matcher, global_matcher
+    def rank_image_indices(self, descriptors: np.ndarray) -> np.ndarray:
+        self.received_descriptors = descriptors
+        return self.ranking
 
 
 @pytest.mark.parametrize("grayscale", [False, True])
@@ -447,90 +410,33 @@ def test_fallback_refines_only_the_required_shortlist(
 
 
 
-def test_retrieve_uses_five_neighbors_without_duplicate_owner_votes() -> None:
-    matcher, global_matcher = retrieval_matcher(
-        ("image-0", "image-1", "image-2"),
-        [0, 0, 1, 2, 2],
-        [
-            [
-                neighbor(0, 10.0),
-                neighbor(1, 20.0),
-                neighbor(2, 40.0),
-                neighbor(3, 400.0),
-                neighbor(4, 410.0),
-            ],
-            [
-                neighbor(2, 14.0),
-                neighbor(3, 20.0),
-                neighbor(4, 21.0),
-                neighbor(0, 22.0),
-                neighbor(1, 23.0),
-            ],
-        ],
-        candidate_count=2,
+def test_retrieve_uses_compact_index_ranking_and_caps_candidates() -> None:
+    descriptors = np.zeros((2, 128), np.uint8)
+    index = FakeRankIndex(
+        ("image-0", "image-1", "image-2", "image-3"),
+        [2, 0, 3, 1],
     )
-
-    result = matcher._retrieve(np.zeros((2, 128), np.float32))
-
-    assert global_matcher.requested_k == 5
-    assert result == ["image-1", "image-0"]
-
-
-def test_retrieve_ignores_unsafe_owners_and_deterministically_fills() -> None:
-    matcher, _ = retrieval_matcher(
-        tuple(f"image-{index}" for index in range(5)),
-        [2, 99, 1, 3, 4],
-        [
-            [
-                neighbor(0, 10.0),
-                neighbor(1, 20.0),
-                neighbor(99, 40.0),
-                neighbor(2, 80.0),
-                neighbor(3, 81.0),
-            ]
-        ],
-        candidate_count=4,
-    )
-
-    result = matcher._retrieve(np.zeros((1, 128), np.float32))
-
-    assert result == ["image-2", "image-0", "image-1", "image-3"]
-    assert len(result) == len(set(result)) == 4
-
-
-@pytest.mark.parametrize(
-    ("descriptor_count", "expected_k", "expected"),
-    [
-        (1, None, ["image-0", "image-1", "image-2"]),
-        (2, 2, ["image-2", "image-0", "image-1"]),
-        (3, 3, ["image-2", "image-3", "image-0"]),
-        (4, 4, ["image-2", "image-3", "image-4"]),
-    ],
-)
-def test_retrieve_caps_knn_to_available_descriptor_rows(
-    descriptor_count: int, expected_k: int | None, expected: list[str]
-) -> None:
-    descriptors = np.repeat(
-        (10.0 * np.arange(descriptor_count, dtype=np.float32))[:, None],
-        128,
-        axis=1,
-    )
-    global_matcher = RecordingGlobalMatcher(descriptors)
     matcher = ImageMatcher.__new__(ImageMatcher)
-    matcher.index = SimpleNamespace(
-        descriptors=descriptors,
-        descriptor_image_indices=np.asarray([2, 3, 4, 1][:descriptor_count], np.int32),
-        image_ids=tuple(f"image-{index}" for index in range(5)),
-        global_matcher=global_matcher,
-    )
+    matcher.index = index
     matcher.settings = Settings(candidate_count=3)
-    matcher._flann_lock = Lock()
+    matcher._retrieval_lock = Lock()
 
-    result = matcher._retrieve(descriptors[:1])
+    result = matcher._retrieve(descriptors)
 
-    assert global_matcher.requested_k == expected_k
-    assert result == expected
-    assert len(result) == len(set(result)) == 3
+    assert result == ["image-2", "image-0", "image-3"]
+    assert index.received_descriptors is descriptors
+
+
+def test_retrieve_caps_candidates_to_gallery_size() -> None:
+    index = FakeRankIndex(("image-0", "image-1"), [1, 0])
+    matcher = ImageMatcher.__new__(ImageMatcher)
+    matcher.index = index
+    matcher.settings = Settings(candidate_count=10)
+    matcher._retrieval_lock = Lock()
+
+    result = matcher._retrieve(np.zeros((1, 128), np.uint8))
+
+    assert result == ["image-1", "image-0"]
 
 
 def test_verify_accepts_large_scale_from_downscaled_candidate(
@@ -1110,15 +1016,18 @@ def test_bounded_benchmark_reuses_isolated_cache(
     namespaces = list((production_cache / "benchmarks").iterdir())
     assert len(namespaces) == 1
     manifest = namespaces[0] / "manifest.json"
-    features = namespaces[0] / "features.npz"
+    metadata = json.loads(manifest.read_text("utf-8"))
+    features = namespaces[0] / metadata["feature_index_dir"]
+    descriptors = features / "descriptors.npy"
     assert manifest.is_file()
-    assert features.is_file()
-    timestamps = (manifest.stat().st_mtime_ns, features.stat().st_mtime_ns)
+    assert features.is_dir()
+    assert descriptors.is_file()
+    timestamps = (manifest.stat().st_mtime_ns, descriptors.stat().st_mtime_ns)
 
     assert main(arguments) == 0
     capsys.readouterr()
     assert list((production_cache / "benchmarks").iterdir()) == namespaces
-    assert (manifest.stat().st_mtime_ns, features.stat().st_mtime_ns) == timestamps
+    assert (manifest.stat().st_mtime_ns, descriptors.stat().st_mtime_ns) == timestamps
     assert sentinel.read_text("utf-8") == "keep"
     assert not (production_cache / "manifest.json").exists()
     assert not (production_cache / "features.npz").exists()

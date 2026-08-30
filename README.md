@@ -30,17 +30,17 @@ uv run uvicorn crop_matcher.main:app --host 127.0.0.1 --port 8000
 
 Open <http://127.0.0.1:8000> in a browser. The left column accepts another existing gallery as an absolute path. A successful selection is stored in `.crop-matcher.json` and reused on the next startup.
 
-Index caches are stored under `.cache/galleries/`. The application does not continuously watch gallery files. After adding, replacing, moving, or deleting images, restart the service or switch to another gallery and back in the WebUI.
+Index caches are stored under `.cache/galleries/` as independent `.npy` arrays. Full SIFT descriptors use lossless `uint8` storage and are memory-mapped with their required keypoint coordinates, so only verified candidates page their local features into memory. A compact global FLANN index keeps up to 128 spatially distributed float descriptors per image instead of indexing every descriptor. The low-resolution template pixels are memory-mapped as well. The application does not continuously watch gallery files. After adding, replacing, moving, or deleting images, restart the service or switch to another gallery and back in the WebUI.
 
 ## Matching Method
 
-During indexing, the application extracts SIFT features from each image and builds a FLANN matcher and a low-resolution grayscale template pyramid. Queries use the following two matching paths.
+During indexing, the application extracts lossless `uint8` SIFT features, selects a spatially balanced representative set for global retrieval, and builds a low-resolution grayscale template pyramid. Queries use the following two matching paths.
 
 ### SIFT and Geometric Verification
 
 1. Convert the query to grayscale. If its shortest edge is below 256 px, scale it proportionally to 256 px before extracting SIFT keypoints and descriptors.
-2. Use FLANN KNN with a Lowe ratio of `0.78` to vote for source-image candidates from the global descriptor index. If this does not produce enough geometrically valid candidates, supplement it with the low-resolution template shortlist.
-3. Rematch descriptors for each candidate and run deterministic RANSAC constrained to uniform scale and translation. At least 4 geometric inliers are required; rotation is not part of the fitted model.
+2. Use FLANN KNN with a Lowe ratio of `0.78` to vote for source-image candidates from the compact representative descriptor index. Rematch each candidate against its memory-mapped full `uint8` descriptors with exact BF L2 distance. If this does not produce enough geometrically valid candidates, supplement it with the low-resolution template shortlist.
+3. Use the local matches to run deterministic RANSAC constrained to uniform scale and translation. At least 4 geometric inliers are required; rotation is not part of the fitted model.
 4. Refine the SIFT scale and translation with a local pixel-correlation search, then warp the candidate region to the query dimensions.
 5. Calculate grayscale and gradient correlations. SIFT inliers validate and locate the crop, then provide a bounded geometric correction to the pixel score.
 

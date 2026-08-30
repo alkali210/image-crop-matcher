@@ -1,9 +1,13 @@
+from collections import defaultdict
 import json
+import shutil
 import tempfile
 from dataclasses import asdict, dataclass
 from hashlib import sha256
 from itertools import pairwise
 from pathlib import Path
+from typing import Any, cast
+from uuid import uuid4
 
 import cv2
 import numpy as np
@@ -12,7 +16,38 @@ from crop_matcher.catalog import ImageCatalog
 from crop_matcher.config import Settings
 from crop_matcher.imaging import read_image, resize_to_max, to_gray
 
-CACHE_SCHEMA_VERSION = 5
+CACHE_SCHEMA_VERSION = 9
+FEATURE_INDEX_DIR_PREFIX = "feature-index-"
+REPRESENTATIVES_PER_IMAGE = 128
+REPRESENTATIVE_GRID_SIZE = 8
+
+_ARRAY_NAMES = (
+    "cache_identity",
+    "image_ids",
+    "points",
+    "point_offsets",
+    "descriptors",
+    "descriptor_offsets",
+    "working_widths",
+    "working_heights",
+    "working_scales",
+    "coarse_pixels",
+    "coarse_offsets",
+    "coarse_widths",
+    "coarse_heights",
+    "coarse_image_indices",
+    "coarse_region_sizes",
+    "representative_descriptors",
+    "representative_image_indices",
+)
+_MMAP_ARRAYS = frozenset(
+    {
+        "points",
+        "descriptors",
+        "coarse_pixels",
+        "representative_descriptors",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,40 +84,79 @@ class FeatureIndex:
     def __init__(
         self,
         image_ids: tuple[str, ...],
-        by_image: dict[str, ImageFeatures],
+        points: np.ndarray,
+        point_offsets: np.ndarray,
         descriptors: np.ndarray,
-        descriptor_image_indices: np.ndarray,
+        descriptor_offsets: np.ndarray,
+        working_widths: np.ndarray,
+        working_heights: np.ndarray,
+        working_scales: np.ndarray,
         coarse_templates: CoarseTemplateFeatures,
+        representative_descriptors: np.ndarray,
+        representative_image_indices: np.ndarray,
         loaded_from_cache: bool,
     ) -> None:
         self.image_ids = image_ids
-        self.by_image = by_image
-        self.descriptors = np.ascontiguousarray(descriptors, dtype=np.float32)
-        self.descriptor_image_indices = np.ascontiguousarray(
-            descriptor_image_indices, dtype=np.int32
-        )
+        self.points = self._typed_array(points, np.float32)
+        self.point_offsets = self._typed_array(point_offsets, np.int64)
+        self.descriptors = self._typed_array(descriptors, np.uint8)
+        self.descriptor_offsets = self._typed_array(descriptor_offsets, np.int64)
+        self.working_widths = self._typed_array(working_widths, np.int32)
+        self.working_heights = self._typed_array(working_heights, np.int32)
+        self.working_scales = self._typed_array(working_scales, np.float64)
         self.coarse_templates = CoarseTemplateFeatures(
-            pixels=np.ascontiguousarray(coarse_templates.pixels, dtype=np.uint8),
-            offsets=np.ascontiguousarray(coarse_templates.offsets, dtype=np.int64),
-            widths=np.ascontiguousarray(coarse_templates.widths, dtype=np.int32),
-            heights=np.ascontiguousarray(coarse_templates.heights, dtype=np.int32),
-            image_indices=np.ascontiguousarray(coarse_templates.image_indices, dtype=np.int32),
-            region_sizes=np.ascontiguousarray(coarse_templates.region_sizes, dtype=np.int32),
+            pixels=self._typed_array(coarse_templates.pixels, np.uint8),
+            offsets=self._typed_array(coarse_templates.offsets, np.int64),
+            widths=self._typed_array(coarse_templates.widths, np.int32),
+            heights=self._typed_array(coarse_templates.heights, np.int32),
+            image_indices=self._typed_array(coarse_templates.image_indices, np.int32),
+            region_sizes=self._typed_array(coarse_templates.region_sizes, np.int32),
+        )
+        self.representative_descriptors = self._typed_array(
+            representative_descriptors,
+            np.float32,
+        )
+        self.representative_image_indices = self._typed_array(
+            representative_image_indices,
+            np.int32,
         )
         self.loaded_from_cache = loaded_from_cache
-        self.global_matcher = cv2.FlannBasedMatcher(
-            {"algorithm": 1, "trees": 5},
-            {"checks": 64},
-        )
-        if len(self.descriptors):
-            self.global_matcher.add([self.descriptors])
-            self.global_matcher.train()
+
+        self.by_image: dict[str, ImageFeatures] = {}
+        for image_index, image_id in enumerate(image_ids):
+            point_start, point_end = self.point_offsets[image_index : image_index + 2]
+            descriptor_start, descriptor_end = self.descriptor_offsets[
+                image_index : image_index + 2
+            ]
+            self.by_image[image_id] = ImageFeatures(
+                points=self.points[point_start:point_end],
+                descriptors=self.descriptors[descriptor_start:descriptor_end],
+                working_width=int(self.working_widths[image_index]),
+                working_height=int(self.working_heights[image_index]),
+                working_scale=float(self.working_scales[image_index]),
+            )
+
+        self._global_matcher: cv2.FlannBasedMatcher | None = None
+        if len(self.representative_descriptors):
+            self._global_matcher = cv2.FlannBasedMatcher(
+                {"algorithm": 1, "trees": 5},
+                {"checks": 64},
+            )
+            self._global_matcher.add([self.representative_descriptors])
+            self._global_matcher.train()
+
+    @staticmethod
+    def _typed_array(array: np.ndarray, dtype: Any) -> np.ndarray:
+        target_dtype = np.dtype(dtype)
+        if array.dtype != target_dtype or not array.flags.c_contiguous:
+            array = np.ascontiguousarray(array, dtype=target_dtype)
+        array.setflags(write=False)
+        return array
 
     @classmethod
     def load_or_build(cls, catalog: ImageCatalog, settings: Settings) -> "FeatureIndex":
         settings.cache_dir.mkdir(parents=True, exist_ok=True)
         manifest_path = settings.cache_dir / "manifest.json"
-        index_path = settings.cache_dir / "features.npz"
         expected_image_ids = tuple(record.image_id for record in catalog.records)
         identity_source = {
             "schema_version": CACHE_SCHEMA_VERSION,
@@ -93,6 +167,7 @@ class FeatureIndex:
                 "sift_contrast_threshold": settings.sift_contrast_threshold,
                 "tile_sizes": list(settings.tile_sizes),
                 "coarse_template_edge": settings.coarse_template_edge,
+                "representatives_per_image": REPRESENTATIVES_PER_IMAGE,
             },
             "images": [asdict(entry) for entry in catalog.manifest],
         }
@@ -105,28 +180,71 @@ class FeatureIndex:
             ).encode("utf-8")
         ).hexdigest()
         metadata = {**identity_source, "cache_identity": cache_identity}
-        if manifest_path.exists() and index_path.exists():
+        if manifest_path.exists():
             try:
-                if json.loads(manifest_path.read_text("utf-8")) == metadata:
-                    return cls._load(index_path, expected_image_ids, cache_identity, settings)
+                existing_metadata = cast(
+                    dict[str, object],
+                    json.loads(manifest_path.read_text("utf-8")),
+                )
+                index_name = existing_metadata.pop("feature_index_dir")
+                if (
+                    existing_metadata == metadata
+                    and isinstance(index_name, str)
+                    and Path(index_name).name == index_name
+                    and index_name.startswith(FEATURE_INDEX_DIR_PREFIX)
+                ):
+                    index_dir = settings.cache_dir / index_name
+                    index = cls._load(
+                        index_dir,
+                        expected_image_ids,
+                        cache_identity,
+                        settings,
+                        loaded_from_cache=True,
+                    )
+                    cls._cleanup_index_dirs(settings.cache_dir, index_name)
+                    return index
             except Exception:
                 # Cache data is disposable; source-image build errors remain outside this block.
                 pass
+
+        index_name = (
+            f"{FEATURE_INDEX_DIR_PREFIX}{cache_identity[:12]}-{uuid4().hex[:8]}"
+        )
+        index_dir = settings.cache_dir / index_name
         index = cls._build(catalog, settings)
-        index._save(index_path, cache_identity)
-        cls._save_manifest(manifest_path, metadata)
-        return index
+        index._save(index_dir, cache_identity)
+        cls._save_manifest(
+            manifest_path,
+            {**metadata, "feature_index_dir": index_name},
+        )
+        del index
+        cls._cleanup_index_dirs(settings.cache_dir, index_name)
+        return cls._load(
+            index_dir,
+            expected_image_ids,
+            cache_identity,
+            settings,
+            loaded_from_cache=False,
+        )
 
     @classmethod
     def _build(cls, catalog: ImageCatalog, settings: Settings) -> "FeatureIndex":
-        sift = cv2.SIFT_create(
-            nfeatures=settings.sift_features,
-            contrastThreshold=settings.sift_contrast_threshold,
+        sift_create = getattr(cv2, "SIFT_create")
+        sift = sift_create(
+            settings.sift_features,
+            3,
+            settings.sift_contrast_threshold,
+            10,
+            1.6,
+            cv2.CV_8U,
+            False,
         )
         image_ids: list[str] = []
-        by_image: dict[str, ImageFeatures] = {}
+        point_groups: list[np.ndarray] = []
         descriptor_groups: list[np.ndarray] = []
-        descriptor_image_groups: list[np.ndarray] = []
+        working_widths: list[int] = []
+        working_heights: list[int] = []
+        working_scales: list[float] = []
         coarse_levels: list[np.ndarray] = []
         coarse_image_indices: list[int] = []
         coarse_region_sizes: list[int] = []
@@ -135,7 +253,7 @@ class FeatureIndex:
 
         for image_index, record in enumerate(catalog.records):
             safe_record = catalog.get(record.image_id)
-            image, scale = resize_to_max(
+            image, working_scale = resize_to_max(
                 read_image(safe_record.path, settings.max_image_pixels),
                 settings.working_max_edge,
             )
@@ -143,34 +261,29 @@ class FeatureIndex:
             keypoints, descriptors = sift.detectAndCompute(gray, None)
             if descriptors is None:
                 points = np.empty((0, 2), dtype=np.float32)
-                descriptors = np.empty((0, 128), dtype=np.float32)
+                descriptors = np.empty((0, 128), dtype=np.uint8)
             else:
                 points = np.ascontiguousarray(
                     np.asarray([keypoint.pt for keypoint in keypoints], dtype=np.float32).reshape(
                         -1, 2
                     )
                 )
-                descriptors = np.ascontiguousarray(descriptors, dtype=np.float32).reshape(-1, 128)
+                descriptors = np.ascontiguousarray(descriptors, dtype=np.uint8).reshape(-1, 128)
 
-            features = ImageFeatures(
-                points=points,
-                descriptors=descriptors,
-                working_width=image.shape[1],
-                working_height=image.shape[0],
-                working_scale=scale,
-            )
             image_ids.append(record.image_id)
-            by_image[record.image_id] = features
+            point_groups.append(points)
             descriptor_groups.append(descriptors)
-            descriptor_image_groups.append(np.full(len(descriptors), image_index, dtype=np.int32))
+            working_widths.append(image.shape[1])
+            working_heights.append(image.shape[0])
+            working_scales.append(working_scale)
 
             height, width = gray.shape[:2]
             shorter_edge = min(width, height)
             for region_size in cls._region_sizes(shorter_edge, settings.tile_sizes):
-                scale = settings.coarse_template_edge / region_size
-                coarse_width = max(1, round(width * scale))
-                coarse_height = max(1, round(height * scale))
-                interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC
+                level_scale = settings.coarse_template_edge / region_size
+                coarse_width = max(1, round(width * level_scale))
+                coarse_height = max(1, round(height * level_scale))
+                interpolation = cv2.INTER_AREA if level_scale < 1.0 else cv2.INTER_CUBIC
                 level = cv2.resize(
                     gray,
                     (coarse_width, coarse_height),
@@ -180,75 +293,220 @@ class FeatureIndex:
                 coarse_image_indices.append(image_index)
                 coarse_region_sizes.append(region_size)
 
-        all_descriptors = cls._concatenate_rows(descriptor_groups, 128, np.float32)
-        if descriptor_image_groups:
-            descriptor_image_indices = np.concatenate(descriptor_image_groups).astype(
-                np.int32, copy=False
+        points = cls._concatenate_rows(point_groups, 2, np.float32)
+        descriptors = cls._concatenate_rows(descriptor_groups, 128, np.uint8)
+        point_offsets = cls._offsets(point_groups)
+        descriptor_offsets = cls._offsets(descriptor_groups)
+        representative_descriptors, representative_image_indices = (
+            cls._build_representatives(
+                points,
+                descriptors,
+                descriptor_offsets,
+                np.asarray(working_widths, dtype=np.int32),
+                np.asarray(working_heights, dtype=np.int32),
             )
-        else:
-            descriptor_image_indices = np.empty(0, dtype=np.int32)
-
+        )
         return cls(
             image_ids=tuple(image_ids),
-            by_image=by_image,
-            descriptors=all_descriptors,
-            descriptor_image_indices=descriptor_image_indices,
+            points=points,
+            point_offsets=point_offsets,
+            descriptors=descriptors,
+            descriptor_offsets=descriptor_offsets,
+            working_widths=np.asarray(working_widths, dtype=np.int32),
+            working_heights=np.asarray(working_heights, dtype=np.int32),
+            working_scales=np.asarray(working_scales, dtype=np.float64),
             coarse_templates=cls._coarse_templates(
-                coarse_levels, coarse_image_indices, coarse_region_sizes
+                coarse_levels,
+                coarse_image_indices,
+                coarse_region_sizes,
             ),
+            representative_descriptors=representative_descriptors,
+            representative_image_indices=representative_image_indices,
             loaded_from_cache=False,
         )
 
-    def _save(self, index_path: Path, cache_identity: str) -> None:
-        point_groups = [self.by_image[image_id].points for image_id in self.image_ids]
-        descriptor_groups = [self.by_image[image_id].descriptors for image_id in self.image_ids]
-        points = self._concatenate_rows(point_groups, 2, np.float32)
-        descriptors = self._concatenate_rows(descriptor_groups, 128, np.float32)
-        point_offsets = self._offsets(point_groups)
-        descriptor_offsets = self._offsets(descriptor_groups)
-        id_width = max((len(image_id) for image_id in self.image_ids), default=1)
+    @staticmethod
+    def _build_representatives(
+        points: np.ndarray,
+        descriptors: np.ndarray,
+        descriptor_offsets: np.ndarray,
+        working_widths: np.ndarray,
+        working_heights: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        groups: list[np.ndarray] = []
+        owner_groups: list[np.ndarray] = []
+        per_cell = max(
+            1,
+            REPRESENTATIVES_PER_IMAGE
+            // (REPRESENTATIVE_GRID_SIZE * REPRESENTATIVE_GRID_SIZE),
+        )
+        for image_index, (start, end) in enumerate(
+            pairwise(descriptor_offsets)
+        ):
+            start = int(start)
+            end = int(end)
+            descriptor_count = end - start
+            if descriptor_count <= 0:
+                continue
+            representative_count = min(
+                REPRESENTATIVES_PER_IMAGE,
+                descriptor_count,
+            )
+            image_points = points[start:end]
+            cell_x = np.clip(
+                (
+                    image_points[:, 0]
+                    / max(1, int(working_widths[image_index]))
+                    * REPRESENTATIVE_GRID_SIZE
+                ).astype(np.int32),
+                0,
+                REPRESENTATIVE_GRID_SIZE - 1,
+            )
+            cell_y = np.clip(
+                (
+                    image_points[:, 1]
+                    / max(1, int(working_heights[image_index]))
+                    * REPRESENTATIVE_GRID_SIZE
+                ).astype(np.int32),
+                0,
+                REPRESENTATIVE_GRID_SIZE - 1,
+            )
+            cells = cell_y * REPRESENTATIVE_GRID_SIZE + cell_x
+            selected: list[int] = []
+            for cell in range(
+                REPRESENTATIVE_GRID_SIZE * REPRESENTATIVE_GRID_SIZE
+            ):
+                cell_indices = np.flatnonzero(cells == cell)
+                if len(cell_indices):
+                    selected.extend(
+                        cell_indices[
+                            np.linspace(
+                                0,
+                                len(cell_indices) - 1,
+                                min(per_cell, len(cell_indices)),
+                                dtype=np.int64,
+                            )
+                        ].tolist()
+                    )
+            if len(selected) < representative_count:
+                selected_mask = np.zeros(descriptor_count, dtype=bool)
+                selected_mask[selected] = True
+                remaining = np.flatnonzero(~selected_mask)
+                needed = representative_count - len(selected)
+                selected.extend(
+                    remaining[
+                        np.linspace(
+                            0,
+                            len(remaining) - 1,
+                            needed,
+                            dtype=np.int64,
+                        )
+                    ].tolist()
+                )
+            indices = np.asarray(selected[:representative_count], dtype=np.int64) + start
+            groups.append(
+                np.ascontiguousarray(descriptors[indices], dtype=np.float32)
+            )
+            owner_groups.append(
+                np.full(representative_count, image_index, dtype=np.int32)
+            )
+        if not groups:
+            return (
+                np.empty((0, 128), dtype=np.float32),
+                np.empty(0, dtype=np.int32),
+            )
+        return (
+            np.ascontiguousarray(np.concatenate(groups), dtype=np.float32),
+            np.concatenate(owner_groups).astype(np.int32, copy=False),
+        )
 
+    def rank_image_indices(self, descriptors: np.ndarray) -> np.ndarray:
+        image_count = len(self.image_ids)
+        if image_count == 0:
+            return np.empty(0, dtype=np.int32)
+        k = min(5, len(self.representative_descriptors))
+        if not len(descriptors) or self._global_matcher is None or k < 2:
+            return np.arange(image_count, dtype=np.int32)
+        query = np.ascontiguousarray(descriptors, dtype=np.float32)
+        matches_by_descriptor = self._global_matcher.knnMatch(query, k=k)
+        votes: dict[int, float] = defaultdict(float)
+        for matches in matches_by_descriptor:
+            voted_owners: set[int] = set()
+            for rank, (match, next_match) in enumerate(
+                zip(matches, matches[1:])
+            ):
+                if (
+                    not np.isfinite(match.distance)
+                    or not np.isfinite(next_match.distance)
+                    or next_match.distance <= 0.0
+                    or match.distance >= 0.78 * next_match.distance
+                ):
+                    continue
+                descriptor_index = int(match.trainIdx)
+                if not 0 <= descriptor_index < len(
+                    self.representative_image_indices
+                ):
+                    continue
+                image_index = int(
+                    self.representative_image_indices[descriptor_index]
+                )
+                if image_index in voted_owners:
+                    continue
+                ratio = max(0.0, match.distance) / next_match.distance
+                votes[image_index] += (1.0 - ratio) / (rank + 1)
+                voted_owners.add(image_index)
+
+        ranked_indices = sorted(
+            votes,
+            key=lambda image_index: (-votes[image_index], image_index),
+        )
+        ranked_set = set(ranked_indices)
+        ranked_indices.extend(
+            image_index
+            for image_index in range(image_count)
+            if image_index not in ranked_set
+        )
+        return np.asarray(ranked_indices, dtype=np.int32)
+
+    def _save(self, index_dir: Path, cache_identity: str) -> None:
+        id_width = max((len(image_id) for image_id in self.image_ids), default=1)
         arrays = {
             "cache_identity": np.asarray(cache_identity, dtype=f"<U{len(cache_identity)}"),
             "image_ids": np.asarray(self.image_ids, dtype=f"<U{id_width}"),
-            "points": points,
-            "point_offsets": point_offsets,
-            "descriptors": descriptors,
-            "descriptor_offsets": descriptor_offsets,
-            "working_widths": np.asarray(
-                [self.by_image[image_id].working_width for image_id in self.image_ids],
-                dtype=np.int32,
-            ),
-            "working_heights": np.asarray(
-                [self.by_image[image_id].working_height for image_id in self.image_ids],
-                dtype=np.int32,
-            ),
-            "working_scales": np.asarray(
-                [self.by_image[image_id].working_scale for image_id in self.image_ids],
-                dtype=np.float64,
-            ),
-            "descriptor_image_indices": self.descriptor_image_indices,
+            "points": self.points,
+            "point_offsets": self.point_offsets,
+            "descriptors": self.descriptors,
+            "descriptor_offsets": self.descriptor_offsets,
+            "working_widths": self.working_widths,
+            "working_heights": self.working_heights,
+            "working_scales": self.working_scales,
             "coarse_pixels": self.coarse_templates.pixels,
             "coarse_offsets": self.coarse_templates.offsets,
             "coarse_widths": self.coarse_templates.widths,
             "coarse_heights": self.coarse_templates.heights,
             "coarse_image_indices": self.coarse_templates.image_indices,
             "coarse_region_sizes": self.coarse_templates.region_sizes,
+            "representative_descriptors": self.representative_descriptors,
+            "representative_image_indices": self.representative_image_indices,
         }
-        temporary_path: Path | None = None
+        index_dir.parent.mkdir(parents=True, exist_ok=True)
+        temporary_dir = Path(
+            tempfile.mkdtemp(prefix=f"{index_dir.name}.tmp-", dir=index_dir.parent)
+        )
         try:
-            with tempfile.NamedTemporaryFile(
-                prefix=f"{index_path.stem}.",
-                suffix=".tmp.npz",
-                dir=index_path.parent,
-                delete=False,
-            ) as temporary:
-                temporary_path = Path(temporary.name)
-            np.savez(temporary_path, **arrays)
-            temporary_path.replace(index_path)
+            for name, array in arrays.items():
+                np.save(temporary_dir / f"{name}.npy", array, allow_pickle=False)
+            temporary_dir.replace(index_dir)
         finally:
-            if temporary_path is not None:
-                temporary_path.unlink(missing_ok=True)
+            shutil.rmtree(temporary_dir, ignore_errors=True)
+
+    @staticmethod
+    def _cleanup_index_dirs(cache_dir: Path, keep_name: str) -> None:
+        for path in cache_dir.glob(f"{FEATURE_INDEX_DIR_PREFIX}*"):
+            if path.name != keep_name:
+                shutil.rmtree(path, ignore_errors=True)
+        shutil.rmtree(cache_dir / "feature-index", ignore_errors=True)
+        (cache_dir / "features.npz").unlink(missing_ok=True)
 
     @staticmethod
     def _save_manifest(manifest_path: Path, metadata: dict[str, object]) -> None:
@@ -272,78 +530,48 @@ class FeatureIndex:
     @classmethod
     def _load(
         cls,
-        index_path: Path,
+        index_dir: Path,
         expected_image_ids: tuple[str, ...],
         expected_cache_identity: str,
         settings: Settings,
+        *,
+        loaded_from_cache: bool,
     ) -> "FeatureIndex":
-        with np.load(index_path, allow_pickle=False) as cache:
-            arrays = {
-                name: cache[name]
-                for name in (
-                    "cache_identity",
-                    "image_ids",
-                    "points",
-                    "point_offsets",
-                    "descriptors",
-                    "descriptor_offsets",
-                    "working_widths",
-                    "working_heights",
-                    "working_scales",
-                    "descriptor_image_indices",
-                    "coarse_pixels",
-                    "coarse_offsets",
-                    "coarse_widths",
-                    "coarse_heights",
-                    "coarse_image_indices",
-                    "coarse_region_sizes",
-                )
-            }
-        cls._validate_archive(arrays, expected_image_ids, expected_cache_identity, settings)
-
-        image_ids = tuple(str(image_id) for image_id in arrays["image_ids"])
-        points = arrays["points"]
-        point_offsets = arrays["point_offsets"]
-        descriptors = arrays["descriptors"]
-        descriptor_offsets = arrays["descriptor_offsets"]
-        working_widths = arrays["working_widths"]
-        working_heights = arrays["working_heights"]
-        working_scales = arrays["working_scales"]
-        descriptor_image_indices = arrays["descriptor_image_indices"]
-        coarse_templates = CoarseTemplateFeatures(
-            pixels=np.ascontiguousarray(arrays["coarse_pixels"]),
-            offsets=np.ascontiguousarray(arrays["coarse_offsets"]),
-            widths=np.ascontiguousarray(arrays["coarse_widths"]),
-            heights=np.ascontiguousarray(arrays["coarse_heights"]),
-            image_indices=np.ascontiguousarray(arrays["coarse_image_indices"]),
-            region_sizes=np.ascontiguousarray(arrays["coarse_region_sizes"]),
-        )
-
-        by_image: dict[str, ImageFeatures] = {}
-        for image_index, image_id in enumerate(image_ids):
-            point_start, point_end = point_offsets[image_index : image_index + 2]
-            descriptor_start, descriptor_end = descriptor_offsets[image_index : image_index + 2]
-            by_image[image_id] = ImageFeatures(
-                points=np.ascontiguousarray(points[point_start:point_end], dtype=np.float32),
-                descriptors=np.ascontiguousarray(
-                    descriptors[descriptor_start:descriptor_end], dtype=np.float32
-                ),
-                working_width=int(working_widths[image_index]),
-                working_height=int(working_heights[image_index]),
-                working_scale=float(working_scales[image_index]),
+        arrays: dict[str, np.ndarray] = {}
+        for name in _ARRAY_NAMES:
+            path = index_dir / f"{name}.npy"
+            arrays[name] = np.load(
+                path,
+                mmap_mode="r" if name in _MMAP_ARRAYS else None,
+                allow_pickle=False,
             )
-
+        cls._validate_arrays(arrays, expected_image_ids, expected_cache_identity, settings)
+        image_ids = tuple(str(image_id) for image_id in arrays["image_ids"])
+        coarse_templates = CoarseTemplateFeatures(
+            pixels=arrays["coarse_pixels"],
+            offsets=arrays["coarse_offsets"],
+            widths=arrays["coarse_widths"],
+            heights=arrays["coarse_heights"],
+            image_indices=arrays["coarse_image_indices"],
+            region_sizes=arrays["coarse_region_sizes"],
+        )
         return cls(
             image_ids=image_ids,
-            by_image=by_image,
-            descriptors=descriptors,
-            descriptor_image_indices=descriptor_image_indices,
+            points=arrays["points"],
+            point_offsets=arrays["point_offsets"],
+            descriptors=arrays["descriptors"],
+            descriptor_offsets=arrays["descriptor_offsets"],
+            working_widths=arrays["working_widths"],
+            working_heights=arrays["working_heights"],
+            working_scales=arrays["working_scales"],
             coarse_templates=coarse_templates,
-            loaded_from_cache=True,
+            representative_descriptors=arrays["representative_descriptors"],
+            representative_image_indices=arrays["representative_image_indices"],
+            loaded_from_cache=loaded_from_cache,
         )
 
     @staticmethod
-    def _validate_archive(
+    def _validate_arrays(
         arrays: dict[str, np.ndarray],
         expected_image_ids: tuple[str, ...],
         expected_cache_identity: str,
@@ -352,18 +580,19 @@ class FeatureIndex:
         expected_dtypes = {
             "points": np.dtype(np.float32),
             "point_offsets": np.dtype(np.int64),
-            "descriptors": np.dtype(np.float32),
+            "descriptors": np.dtype(np.uint8),
             "descriptor_offsets": np.dtype(np.int64),
             "working_widths": np.dtype(np.int32),
             "working_heights": np.dtype(np.int32),
             "working_scales": np.dtype(np.float64),
-            "descriptor_image_indices": np.dtype(np.int32),
             "coarse_pixels": np.dtype(np.uint8),
             "coarse_offsets": np.dtype(np.int64),
             "coarse_widths": np.dtype(np.int32),
             "coarse_heights": np.dtype(np.int32),
             "coarse_image_indices": np.dtype(np.int32),
             "coarse_region_sizes": np.dtype(np.int32),
+            "representative_descriptors": np.dtype(np.float32),
+            "representative_image_indices": np.dtype(np.int32),
         }
         cache_identity = arrays["cache_identity"]
         if (
@@ -411,18 +640,24 @@ class FeatureIndex:
         if not np.array_equal(np.diff(point_offsets), np.diff(descriptor_offsets)):
             raise ValueError("Cached point and descriptor rows differ")
 
-        descriptor_owners = arrays["descriptor_image_indices"]
-        if descriptor_owners.shape != (len(arrays["descriptors"]),):
-            raise ValueError("Invalid cached descriptor owners")
-        if len(descriptor_owners) and (
-            descriptor_owners.min() < 0 or descriptor_owners.max() >= image_count
+        representative_descriptors = arrays["representative_descriptors"]
+        representative_image_indices = arrays[
+            "representative_image_indices"
+        ]
+        if (
+            representative_descriptors.ndim != 2
+            or representative_descriptors.shape[1] != 128
         ):
-            raise ValueError("Cached descriptor owner is out of range")
-        expected_owners = np.repeat(
-            np.arange(image_count, dtype=np.int32), np.diff(descriptor_offsets)
-        )
-        if not np.array_equal(descriptor_owners, expected_owners):
-            raise ValueError("Cached descriptor owners do not match offsets")
+            raise ValueError("Invalid cached representative descriptors")
+        if representative_image_indices.shape != (
+            len(representative_descriptors),
+        ):
+            raise ValueError("Invalid cached representative owners")
+        if len(representative_image_indices) and (
+            representative_image_indices.min() < 0
+            or representative_image_indices.max() >= image_count
+        ):
+            raise ValueError("Cached representative owner is out of range")
 
         coarse_names = (
             "coarse_pixels",
@@ -464,9 +699,13 @@ class FeatureIndex:
         if not np.array_equal(np.diff(coarse_offsets), coarse_widths * coarse_heights):
             raise ValueError("Cached coarse template spans do not match dimensions")
         coarse_owners = arrays["coarse_image_indices"]
-        if len(coarse_owners) and (coarse_owners.min() < 0 or coarse_owners.max() >= image_count):
+        if len(coarse_owners) and (
+            coarse_owners.min() < 0 or coarse_owners.max() >= image_count
+        ):
             raise ValueError("Cached coarse template owner is out of range")
-        if not np.array_equal(np.unique(coarse_owners), np.arange(image_count, dtype=np.int32)):
+        if image_count and not np.array_equal(
+            np.unique(coarse_owners), np.arange(image_count, dtype=np.int32)
+        ):
             raise ValueError("Cached coarse templates do not cover every image")
 
         expected_owners: list[int] = []
@@ -478,7 +717,9 @@ class FeatureIndex:
         ):
             width = int(working_width)
             height = int(working_height)
-            for region_size in FeatureIndex._region_sizes(min(width, height), settings.tile_sizes):
+            for region_size in FeatureIndex._region_sizes(
+                min(width, height), settings.tile_sizes
+            ):
                 scale = settings.coarse_template_edge / region_size
                 expected_owners.append(image_index)
                 expected_region_sizes.append(region_size)
@@ -490,7 +731,9 @@ class FeatureIndex:
                 arrays["coarse_region_sizes"],
                 np.asarray(expected_region_sizes, dtype=np.int32),
             )
-            and np.array_equal(arrays["coarse_widths"], np.asarray(expected_widths, dtype=np.int32))
+            and np.array_equal(
+                arrays["coarse_widths"], np.asarray(expected_widths, dtype=np.int32)
+            )
             and np.array_equal(
                 arrays["coarse_heights"], np.asarray(expected_heights, dtype=np.int32)
             )
@@ -503,15 +746,18 @@ class FeatureIndex:
         region_sizes = set(configured_sizes)
         region_sizes.update((left + right) // 2 for left, right in pairwise(configured_sizes))
         region_sizes = {size for size in region_sizes if size <= shorter_edge}
-        if not region_sizes:
+        if not region_sizes and shorter_edge > 0:
             region_sizes.add(shorter_edge)
         return sorted(region_sizes)
 
     @staticmethod
-    def _concatenate_rows(groups: list[np.ndarray], width: int, dtype: np.dtype) -> np.ndarray:
+    def _concatenate_rows(groups: list[np.ndarray], width: int, dtype: Any) -> np.ndarray:
         if not groups:
             return np.empty((0, width), dtype=dtype)
-        return np.ascontiguousarray(np.concatenate(groups, axis=0), dtype=dtype).reshape(-1, width)
+        return np.ascontiguousarray(
+            np.concatenate(groups, axis=0),
+            dtype=dtype,
+        ).reshape(-1, width)
 
     @staticmethod
     def _offsets(groups: list[np.ndarray]) -> np.ndarray:
