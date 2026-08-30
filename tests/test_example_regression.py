@@ -113,7 +113,7 @@ def test_manifest_validation_rejects_duplicate_query_keys(tmp_path: Path) -> Non
 def test_parser_defaults() -> None:
     arguments = example_regression._parser().parse_args([])
 
-    assert arguments.gallery == Path("songs")
+    assert arguments.gallery == Path("gallery")
     assert arguments.examples == Path("examples")
     assert arguments.max_p95_ms == 1000.0
 

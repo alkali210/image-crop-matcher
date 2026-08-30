@@ -275,7 +275,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Benchmark deterministic source-image crop matching"
     )
-    parser.add_argument("--gallery", type=Path, default=Path("songs"))
+    parser.add_argument("--gallery", type=Path, default=Path("gallery"))
     parser.add_argument("--samples-per-image", type=_positive_int, default=4)
     parser.add_argument("--max-images", type=_positive_int)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)

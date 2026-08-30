@@ -8,7 +8,7 @@ Image Crop Matcher is a local crop-retrieval tool. It finds the source image for
 - Returns up to 5 distinct source-image candidates for each uploaded crop, ranked by similarity and linked to the original files.
 - Switches gallery paths from the WebUI; a new gallery is indexed in the background while the current gallery remains available.
 - Supports repeated uploads and light/dark themes that follow the browser preference.
-- Uses `songs/` as the default gallery. Images whose filename stem ends in `_256` are treated as generated thumbnails and excluded.
+- Uses `gallery/` as the default gallery. Images whose filename stem ends in `_256` are treated as generated thumbnails and excluded.
 - Limits each upload to 10 MiB and each decoded image to 25 MP.
 
 The matcher is intended for regions cropped from gallery images and then resized. Rotation, mirroring, perspective transforms, borders, watermarks, and interface overlays are not supported transformations.
@@ -22,7 +22,7 @@ python -m pip install uv
 uv sync
 ```
 
-Place source images under `songs/`, then start the service:
+Place source images under `gallery/`, then start the service:
 
 ```bash
 uv run uvicorn crop_matcher.main:app --host 127.0.0.1 --port 8000
@@ -105,7 +105,7 @@ The base URL is `http://127.0.0.1:8000`. Interactive OpenAPI documentation is av
 `POST /api/gallery` accepts JSON:
 
 ```json
-{"path":"C:\\images\\songs"}
+{"path":"C:\\images\\gallery"}
 ```
 
 A newly accepted background build returns `202`; an already active target returns `200`. An invalid path returns `400`. Initial indexing or another gallery switch in progress returns `409`.

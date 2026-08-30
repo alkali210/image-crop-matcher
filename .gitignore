@@ -1,4 +1,4 @@
-songs/
+gallery/
 .agents/
 .worktrees/
 .cache/
@@ -9,5 +9,4 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .venv/
-benchmark-failures/
 .playwright-cli/

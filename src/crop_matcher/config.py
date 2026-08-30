@@ -4,7 +4,7 @@ from pathlib import Path
 
 @dataclass(frozen=True, slots=True)
 class Settings:
-    gallery_dir: Path = Path("songs")
+    gallery_dir: Path = Path("gallery")
     cache_dir: Path = Path(".cache")
     selection_file: Path = Path(".crop-matcher.json")
     max_upload_bytes: int = 10 * 1024 * 1024

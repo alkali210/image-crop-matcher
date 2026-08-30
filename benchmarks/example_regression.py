@@ -125,7 +125,7 @@ def _nonnegative_float(value: str) -> float:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run real-example crop matching regression cases")
-    parser.add_argument("--gallery", type=Path, default=Path("songs"))
+    parser.add_argument("--gallery", type=Path, default=Path("gallery"))
     parser.add_argument("--examples", type=Path, default=Path("examples"))
     parser.add_argument("--max-p95-ms", type=_nonnegative_float, default=1000.0)
     return parser
